@@ -1,0 +1,252 @@
+---
+title: "Feature importance and bootstrap selection stability"
+subtitle: "Deep immune cell phenotyping predicts influenza vaccine immunogenicity in HCT recipients"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 2
+    number_sections: true
+    code_folding: show
+    self_contained: true
+    fig_width: 10
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 7)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(knitr)
+})
+```
+
+# What this notebook does
+
+This notebook asks which cellular-composition features drive the prediction, and
+whether those choices are stable rather than accidents of the particular
+patients sampled. It produces:
+
+- **Figure 4** -- signed feature importance in the full model (M4).
+- **Supplementary Figure (stability landscape)** -- selection frequency versus
+  sign consistency for every cluster feature.
+- **Supplementary Figure (selection frequency)** -- how often each cluster
+  feature is selected across bootstraps.
+- **Supplementary Figure (coefficient distributions)** -- the spread of each
+  stable feature's coefficient across bootstraps.
+
+The stability analysis resamples patients 200 times (with the regularization
+strength held fixed at the full-sample value) and refits the elastic net on the
+**production atlas**, recording which features are kept and with what
+coefficient each time. Because this uses a single all-patient atlas, it carries
+a small amount of representation leakage and is used only for descriptive
+stability, not for the performance claims (those rest on the leakage-free
+per-fold pipeline in notebooks 01--02).
+
+```{r paths}
+# Edit these to your local copy of the intermediate data (not distributed; see
+# README, Data Availability).
+REPO <- "/home/amir/repo/flu-cellular-prediction"
+
+BOOT_FILE <- file.path(REPO, "results", "final_atlas_production", "bootstrap_importance_a6fd33eb.RData")
+BIO_FILE  <- file.path(REPO, "results", "final_atlas_production", "biology_production_90203bf3.RData")
+ATLAS_FILE <- file.path(REPO, "results", "final_atlas_production", "final_atlas_e862228d.RData")
+ANN_FILE  <- file.path(REPO, "results", "reports", "cluster_annotations_corrected.csv")
+
+VIRUSES <- c("h1n1", "h3n2", "bvic")
+```
+
+```{r load}
+if (file.exists(BOOT_FILE)) {
+  # Load the 200-bootstrap coefficient records (fast: no refitting).
+  boot <- new.env(parent = emptyenv()); load(BOOT_FILE, envir = boot)
+} else {
+  # ---- Self-contained bootstrap refit on the production atlas. Needs the
+  #      production-atlas feature matrix (X_clust) and outcomes (Y_mat) from
+  #      final_atlas_*.RData, but no raw cells. Runs ~200 glmnet fits. ----
+  if (!file.exists(ATLAS_FILE))
+    stop("Neither the bootstrap cache nor the production atlas was found.")
+  a <- new.env(parent = emptyenv()); load(ATLAS_FILE, envir = a)
+  suppressPackageStartupMessages(library(glmnet))
+  set.seed(7000L); n <- nrow(a$X_clust); recs <- list()
+  for (b in seq_len(200L)) {
+    idx <- sample.int(n, n, replace = TRUE)
+    fit <- glmnet(a$X_clust[idx, ], a$Y_mat[idx, ], family = "mgaussian",
+                  alpha = a$ALPHA, lambda = a$cv_fit$lambda.min)
+    cf <- coef(fit)
+    recs[[b]] <- rbindlist(lapply(VIRUSES, function(v) data.table(
+      bootstrap = b, virus = v, feature = rownames(cf[[v]]),
+      coef = as.numeric(cf[[v]]))))
+  }
+  boot <- new.env(); boot$coef_dt <- rbindlist(recs)
+  stop("Bootstrap refit complete; re-save as ", BOOT_FILE, " to cache it.")
+}
+coef_dt   <- as.data.table(boot$coef_dt)
+stability <- as.data.table(boot$stability)
+lambda_ref <- boot$lambda_ref
+
+# Curated annotations for readable feature labels.
+ann <- as.data.table(read.csv(ANN_FILE, stringsAsFactors = FALSE))
+ann[, cluster_id := as.integer(cluster_id)]
+# Short label = annotation with any parenthetical qualifier removed.
+ann[, short := trimws(gsub("\\s+", " ", gsub("\\s*\\(.*?\\)", "", annotation)))]
+
+cat("Bootstraps:", uniqueN(coef_dt$bootstrap), "\n")
+cat("Fixed lambda.min:", round(lambda_ref, 4), "\n")
+```
+
+# Figure 4: signed feature importance in the full model (M4)
+
+Each feature's importance is its elastic-net coefficient multiplied by the
+feature's standard deviation, averaged across the 200 bootstraps. Multiplying by
+the standard deviation puts features on a comparable scale (importance per
+typical swing in the feature). The sign is kept: bars to the right (red) are
+positive predictors of the fold-rise; bars to the left (blue) are negative.
+Baseline titers dominate the magnitude in every antigen -- negative, because a
+higher pre-vaccination titer predicts a smaller fold-rise.
+
+```{r figure4, fig.width=14, fig.height=11}
+bio <- new.env(parent = emptyenv()); load(BIO_FILE, envir = bio)
+clr_sd <- apply(bio$clr_features, 2, sd)               # SD of each cluster feature
+sd_dt  <- data.table(feature = names(clr_sd), sd = as.numeric(clr_sd))
+
+# Mean signed coefficient per feature and antigen, times the feature SD.
+agg <- coef_dt[feature != "(Intercept)",
+               .(mean_coef = mean(coef)), by = .(virus, feature)]
+agg <- merge(agg, sd_dt, by = "feature", all.x = TRUE)
+agg[is.na(sd), sd := 1]                                # covariates: unit scale
+agg[, signed_imp := mean_coef * sd]
+
+# Readable labels: cluster features get "C<id>: <cell type>"; covariates get
+# plain-English names. Covariates are listed first, then clusters numerically.
+agg[, is_cluster := grepl("^cluster_", feature)]
+agg[, cluster_id := ifelse(is_cluster, as.integer(sub("cluster_", "", feature)), NA_integer_)]
+cov_pretty <- c(baseline_h1n1 = "Baseline H1N1 titer", baseline_h3n2 = "Baseline H3N2 titer",
+                baseline_bvic = "Baseline B/Vic titer", dose_HD = "Dose: HD", age = "Age",
+                sex_Male = "Sex: Male", time_post_transplant = "Time post-transplant")
+cov_order <- names(cov_pretty)
+short_lu <- setNames(ann$short, as.character(ann$cluster_id))   # cluster id -> short name
+agg[, display_label := ifelse(is_cluster,
+  sprintf("C%d: %s", cluster_id, short_lu[as.character(cluster_id)]),
+  ifelse(feature %in% names(cov_pretty), cov_pretty[feature], feature))]
+agg[, sort_key := ifelse(is_cluster, 1000L + cluster_id, match(feature, cov_order))]
+agg <- agg[!is.na(sort_key)]
+agg[, display_label := factor(display_label,
+                              levels = unique(agg[order(-sort_key), display_label]))]
+
+ggplot(agg, aes(display_label, signed_imp, fill = signed_imp > 0)) +
+  geom_col(width = 0.8) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  coord_flip() +
+  facet_wrap(~ virus, ncol = 3, scales = "free_x",
+             labeller = labeller(virus = c(h1n1 = "H1N1", h3n2 = "H3N2", bvic = "B/Victoria"))) +
+  scale_fill_manual(values = c("TRUE" = "#d6604d", "FALSE" = "#4393c3"),
+                    labels = c("TRUE" = "Positive predictor", "FALSE" = "Negative predictor"),
+                    name = NULL) +
+  labs(title = "M4 standardized feature importance (signed: coefficient x SD)",
+       subtitle = "Production atlas; averaged across 200 bootstraps. Right of zero = positive predictor of fold-rise",
+       x = NULL, y = "Average signed importance across bootstraps") +
+  theme_bw(base_size = 9) +
+  theme(plot.title = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(size = 9, color = "gray30"),
+        axis.text.y = element_text(size = 7), legend.position = "bottom",
+        panel.grid.minor = element_blank())
+```
+
+Among the cluster features, the CD21-low B cell subset (C4) and the activated
+CD38-high double-negative T cell (C32) are the strongest positive predictors,
+while several CD4+ memory and APC subsets contribute negatively -- best read, in
+a compositional representation, as markers of an incomplete reconstitution state
+where the mature response-driving populations have not yet expanded.
+
+# Supplementary Figure: stability landscape
+
+For each cluster feature we plot how often it was selected (across the 200
+bootstraps) against how consistently its coefficient kept the same sign. The
+upper-right corner holds the robust features: selected often and with a stable
+direction. Point size is the average absolute coefficient.
+
+```{r stability-landscape, fig.width=11, fig.height=6}
+cluster_stab <- stability[grepl("^cluster_", feature)]
+ggplot(cluster_stab, aes(selection_freq, sign_consistency,
+                         size = abs(mean_coef), label = feature)) +
+  geom_point(alpha = 0.6, color = "#2E86AB") +
+  geom_text(size = 2.2, vjust = -0.8, check_overlap = TRUE, show.legend = FALSE) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = 0.8, linetype = "dashed", alpha = 0.5) +
+  facet_wrap(~ virus) +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(limits = c(0, 1.05)) +
+  labs(title = "Stability landscape: selection frequency vs sign consistency",
+       subtitle = "Upper-right = robust; point size = |mean coefficient|",
+       x = "Selection frequency", y = "Sign consistency", size = "|Mean coef|") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), strip.text = element_text(face = "bold"))
+```
+
+# Supplementary Figure: selection frequency
+
+The multitask elastic net enforces the same sparsity pattern across all three
+antigens (a feature is selected for all three or none), so selection frequency
+is identical across antigens and one panel suffices. The dashed line marks 50%
+and the dotted line 90%.
+
+```{r selection-frequency, fig.width=7, fig.height=8}
+sel_single <- cluster_stab[virus == VIRUSES[1]]
+ggplot(sel_single, aes(reorder(feature, selection_freq), selection_freq)) +
+  geom_col(fill = "#2E86AB", alpha = 0.8) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0.9, linetype = "dotted", color = "darkred") +
+  coord_flip() +
+  labs(title = "Selection frequency per cluster (200 bootstraps)",
+       subtitle = "Identical across antigens (multitask shared sparsity)",
+       x = NULL, y = "Selection frequency") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r stability-counts}
+# How many clusters clear each selection-frequency threshold (per antigen).
+counts <- rbindlist(lapply(VIRUSES, function(v) data.table(
+  antigen = v,
+  `>=50%` = cluster_stab[virus == v & selection_freq >= 0.5, .N],
+  `>=90%` = cluster_stab[virus == v & selection_freq >= 0.9, .N])))
+kable(counts, caption = "Clusters selected above each stability threshold, per antigen.")
+```
+
+The most reliably selected features are cluster 4 (CD21-low B, 99.0%) and
+cluster 32 (activated double-negative T, 97.5%). Eighteen of 33 clusters are
+selected in at least half of bootstraps for each antigen, and every feature that
+is stable in one antigen is stable in all three -- a pan-influenza signature
+rather than antigen-specific noise.
+
+# Supplementary Figure: coefficient distributions
+
+For the stably selected features, the coefficient's spread across bootstraps
+shows whether the effect size (not just the selection) is reproducible. Tight
+boxes mean the elastic net assigns each feature a consistent weight.
+
+```{r coef-distributions, fig.width=12, fig.height=10}
+stable_features <- cluster_stab[selection_freq > 0.5, unique(feature)]
+coef_stable <- coef_dt[feature %in% stable_features]
+ggplot(coef_stable, aes(reorder(feature, coef, FUN = median), coef)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_boxplot(fill = "#2E86AB", alpha = 0.6, outlier.size = 0.3) +
+  coord_flip() +
+  facet_wrap(~ virus, scales = "free_x") +
+  labs(title = "Coefficient distributions for stably selected features",
+       subtitle = sprintf("%d features selected in >50%% of bootstraps", length(stable_features)),
+       x = NULL, y = "Coefficient") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), strip.text = element_text(face = "bold"))
+```
+
+The largest positive coefficients belong to cluster 4 and cluster 32, and the
+largest negative to cluster 6 (a CD4+ memory population); the tight interquartile
+ranges confirm these are stable effect estimates rather than artifacts of
+particular bootstrap samples.

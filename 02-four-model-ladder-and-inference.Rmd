@@ -1,0 +1,377 @@
+---
+title: "Four-model ladder, bootstrap inference, and effect-size context"
+subtitle: "Deep immune cell phenotyping predicts influenza vaccine immunogenicity in HCT recipients"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 2
+    number_sections: true
+    code_folding: show
+    self_contained: true
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(patchwork)
+  library(knitr)
+})
+```
+
+# What this notebook does
+
+This is the core quantitative notebook. It reports how much a patient's
+pre-vaccination cellular composition improves prediction of the influenza
+antibody response, beyond the pre-vaccination titer and standard clinical
+factors, and it establishes that the improvement is statistically significant
+under inference that respects the correlated structure of the data.
+
+It produces the manuscript's three main tables and Figure 2, plus the
+supplementary noise-floor table:
+
+- **Table 1** -- prediction error (MSE) of the four-model ladder (M1--M4).
+- **Table 2** -- recipient-clustered bootstrap confidence intervals and
+  p-values for each pairwise model comparison.
+- **Figure 2** -- the four-model ladder with those confidence intervals.
+- **Table 3** -- prediction error stratified by pre-vaccination titer quartile.
+- **Supplementary Table (noise floor)** -- model performance placed against the
+  irreducible measurement noise of the HAI assay.
+
+```{r paths}
+# Edit these to your local copy of the intermediate data (not distributed; see
+# README, Data Availability). With them present, this notebook knits by loading
+# cached objects rather than re-running the nested cross-validation or bootstrap.
+FAST <- "/fast/datasets/flu_cellular_prediction"
+REPO <- "/home/amir/repo/flu-cellular-prediction"
+
+AGG_PATH   <- file.path(FAST, "per_fold_atlas_5000", "aggregated", "E2_aggregated.RData")
+PER_FOLD   <- file.path(FAST, "per_fold_atlas_5000")
+BOOT_PATH  <- file.path(FAST, "post_hoc_5000", "recipient_bootstrap", "E3_recipient_boot.RData")
+STRAT_PATH <- file.path(FAST, "post_hoc_5000", "stratified", "E2_stratified.RData")
+NOISE_CSV  <- file.path(FAST, "post_hoc_5000", "E2_noise_floor.csv")
+
+VIRUSES <- c("h1n1", "h3n2", "bvic")
+antigen_label <- c(h1n1 = "H1N1", h3n2 = "H3N2", bvic = "B/Victoria")
+```
+
+# The four models and how they are compared
+
+The outcome is the log fold-rise in hemagglutination-inhibition (HAI) titer,
+$y = \log(\text{titer}_{\text{post}} / \text{titer}_{\text{pre}})$, measured for
+each of three influenza antigens (H1N1, H3N2, B/Victoria). We compare four
+nested models that differ only in which blocks of features they contain, so the
+change in error from one rung to the next isolates the contribution of the block
+that was added:
+
+- **M1 (titers only)** -- the three log pre-vaccination titers.
+- **M2 (titers + clinical)** -- M1 plus vaccine dose, age, sex, and time since
+  transplant.
+- **M3 (titers + clusters)** -- M1 plus the cellular-composition features.
+- **M4 (full)** -- M2 plus the cellular-composition features.
+
+All four are fit with the **same** regularized model family: a multitask
+elastic net (glmnet `mgaussian`, mixing parameter $\alpha = 0.9$) that predicts
+all three antigen responses jointly and shares one set of selected features
+across them. Using one model family throughout removes any confound between the
+amount of regularization and the addition of features. The cellular-composition
+features themselves are the centered-log-ratio (CLR) transform of each patient's
+meta-cluster proportions,
+
+$$\text{CLR}(\mathbf{p}_i)_j = \log(p_{ij}) - \tfrac{1}{k}\sum_{\ell=1}^{k}\log(p_{i\ell}),$$
+
+which expresses each population's abundance relative to the patient's
+geometric-mean abundance (a pseudocount of 0.5 is added to raw counts to handle
+zero-count populations). Performance is measured by 5-fold nested
+cross-validation with folds grouped by recipient, and errors are aggregated
+across folds weighted by test-set size.
+
+```{r load-aggregated}
+if (file.exists(AGG_PATH)) {
+  # Load the aggregated out-of-fold (held-out) predictions and outcomes.
+  load(AGG_PATH)
+} else {
+  # ---- Self-contained aggregation of the five per-fold artifacts. This does
+  #      not touch raw data; it stitches together the held-out predictions that
+  #      the per-fold pipeline (notebook 01) already computed. ----
+  fold_files <- file.path(PER_FOLD, sprintf("fold_%d", 1:5),
+                          sprintf("fold_%d_all.RData", 1:5))
+  if (!all(file.exists(fold_files)))
+    stop("Neither the aggregated result nor the per-fold artifacts were found.")
+  common_p_ids <- NULL
+  acc <- list()
+  for (f in fold_files) {
+    e <- new.env(parent = emptyenv()); load(f, envir = e)
+    acc[[length(acc) + 1]] <- list(ids = e$test_p_ids, Y = e$Y_test,
+      M1 = e$pred_M1_en_test, M2 = e$pred_M2_en_test,
+      M3 = e$pred_M3_en_test, M4 = e$pred_M4_en_test)
+  }
+  common_p_ids <- unlist(lapply(acc, function(a) a$ids))
+  bind <- function(key) do.call(rbind, lapply(acc, function(a) a[[key]]))
+  oof_Y         <- bind("Y")
+  oof_pred_M1_en <- bind("M1"); oof_pred_M2_en <- bind("M2")
+  oof_pred_M3_en <- bind("M3"); oof_pred_M4_en <- bind("M4")
+}
+
+# Held-out predictions for the four elastic-net models, aligned to oof_Y.
+model_preds <- list(M1 = oof_pred_M1_en, M2 = oof_pred_M2_en,
+                    M3 = oof_pred_M3_en, M4 = oof_pred_M4_en)
+```
+
+# Table 1: four-model ladder prediction performance
+
+Because every episode is predicted exactly once, while held out, the overall
+test-set-weighted MSE is simply the mean squared error across all episodes and
+antigens. Adding cellular-composition features to the titers-only baseline
+(M1 to M3) is the cleanest test of the cellular signal; adding them on top of
+the full clinical model (M2 to M4) is the most clinically relevant test.
+
+```{r table1}
+mse_of <- function(pred, v = NULL) {
+  if (is.null(v)) mean((as.vector(pred) - as.vector(oof_Y))^2)
+  else mean((pred[, v] - oof_Y[, v])^2)
+}
+table1 <- data.frame(
+  Model    = names(model_preds),
+  Features = c("Titers only", "Titers + clinical",
+               "Titers + clusters", "Full (clinical + clusters)"),
+  Overall  = sapply(model_preds, mse_of),
+  H1N1     = sapply(model_preds, mse_of, v = "h1n1"),
+  H3N2     = sapply(model_preds, mse_of, v = "h3n2"),
+  `B/Victoria` = sapply(model_preds, mse_of, v = "bvic"),
+  check.names = FALSE, row.names = NULL)
+
+kable(table1, digits = 3, caption =
+  "Table 1. Four-model ladder: n_test-weighted MSE from 5-fold nested cross-validation.")
+```
+
+Adding cluster features to baseline titers lowers overall MSE from
+`r sprintf("%.3f", table1$Overall[1])` (M1) to
+`r sprintf("%.3f", table1$Overall[3])` (M3). Clinical covariates alone (M1 to M2)
+move it only slightly, and once clusters are present the clinical covariates add
+essentially nothing (M3 to M4), indicating that cellular composition subsumes
+the predictive information in the standard clinical variables. The formal
+inference for each of these comparisons is in Table 2.
+
+# Table 2: recipient-clustered bootstrap inference
+
+The 343 episodes are not independent: 80 recipients contributed two episodes,
+and every episode contributes three antigen measurements. Measurements from the
+same recipient resemble one another, so resampling individual rows would
+understate the true uncertainty. We therefore use a **recipient-clustered paired
+bootstrap**: we resample whole recipients with replacement ($B = 2{,}000$), and
+when a recipient is drawn, all of their episodes and all three antigen outcomes
+travel together as a block. For each replicate we recompute the percent MSE
+improvement; the 95% CI is the 2.5th--97.5th percentile and the p-value is
+two-sided. This bootstraps the smooth functional of paired prediction error
+(not the selected coefficients, whose bootstrap is known to be inconsistent).
+
+```{r recipient-bootstrap}
+if (file.exists(BOOT_PATH)) {
+  # Load the precomputed recipient-clustered bootstrap (fast).
+  load(BOOT_PATH)   # provides results_df (data.table)
+  boot_tab <- as.data.frame(results_df)
+} else {
+  # ---- Self-contained recipient-clustered bootstrap from the per-fold held-out
+  #      predictions. No raw data needed; runs in seconds. ----
+  fold_files <- file.path(PER_FOLD, sprintf("fold_%d", 1:5),
+                          sprintf("fold_%d_all.RData", 1:5))
+  if (!all(file.exists(fold_files)))
+    stop("Recipient bootstrap needs either its cache or the per-fold artifacts.")
+  dt <- rbindlist(lapply(fold_files, function(f) {
+    e <- new.env(parent = emptyenv()); load(f, envir = e)
+    rbindlist(lapply(seq_along(VIRUSES), function(vi) data.table(
+      patient_id = e$test_p_ids, virus = VIRUSES[vi], Y_true = e$Y_test[, vi],
+      pred_M1 = e$pred_M1_en_test[, vi], pred_M2 = e$pred_M2_en_test[, vi],
+      pred_M3 = e$pred_M3_en_test[, vi], pred_M4 = e$pred_M4_en_test[, vi])))
+  }))
+  dt[, base_recipient := sub("_yr[0-9]+$", "", patient_id)]
+  for (k in 1:4) set(dt, j = paste0("err_M", k),
+                     value = (dt[[paste0("pred_M", k)]] - dt$Y_true)^2)
+  rec_ids <- unique(dt$base_recipient)
+  rec_rows <- split(seq_len(nrow(dt)), dt$base_recipient)[rec_ids]
+  cmp <- data.frame(comparison = c("M1_to_M2","M1_to_M3","M1_to_M4",
+                                   "M2_to_M3","M2_to_M4","M3_to_M4"),
+                    a = c("M1","M1","M1","M2","M2","M3"),
+                    b = c("M2","M3","M4","M3","M4","M4"),
+                    stringsAsFactors = FALSE)
+  boot_one <- function(a, b, i, B = 2000L) {
+    ea <- dt[[paste0("err_", a)]]; eb <- dt[[paste0("err_", b)]]
+    obs <- (mean(ea) - mean(eb)) / mean(ea) * 100
+    set.seed(7000L + i)
+    d <- vapply(seq_len(B), function(bi) {
+      rows <- unlist(rec_rows[sample.int(length(rec_ids), length(rec_ids), TRUE)])
+      (mean(ea[rows]) - mean(eb[rows])) / mean(ea[rows]) * 100
+    }, numeric(1))
+    p <- min(1, 2 * min(mean(d <= 0), mean(d >= 0)))
+    data.frame(delta_pct = obs, ci_low_pct = quantile(d, .025),
+               ci_high_pct = quantile(d, .975), p_two_sided = p)
+  }
+  boot_tab <- do.call(rbind, lapply(seq_len(nrow(cmp)), function(i)
+    cbind(comparison = cmp$comparison[i], scope = "overall",
+          boot_one(cmp$a[i], cmp$b[i], i))))
+}
+
+# Assemble Table 2 in the manuscript's row order (overall scope only).
+row_order <- c("M1_to_M3", "M1_to_M4", "M2_to_M4", "M2_to_M3", "M1_to_M2", "M3_to_M4")
+pretty_cmp <- c(
+  M1_to_M3 = "M1->M3 (clusters over titers)",
+  M1_to_M4 = "M1->M4 (full over titers)",
+  M2_to_M4 = "M2->M4 (clusters over clinical)",
+  M2_to_M3 = "M2->M3 (clusters vs clinical)",
+  M1_to_M2 = "M1->M2 (clinical over titers)",
+  M3_to_M4 = "M3->M4 (clinical on top of clusters)")
+ov <- boot_tab[boot_tab$scope == "overall", ]
+ov <- ov[match(row_order, ov$comparison), ]
+table2 <- data.frame(
+  Comparison = pretty_cmp[ov$comparison],
+  `Delta MSE (%)` = round(ov$delta_pct, 1),
+  `95% CI` = sprintf("[%.1f, %.1f]", ov$ci_low_pct, ov$ci_high_pct),
+  `p (two-sided)` = sprintf("%.3f", ov$p_two_sided),
+  check.names = FALSE, row.names = NULL)
+kable(table2, caption =
+  "Table 2. Recipient-clustered paired bootstrap (B = 2,000) for pairwise model comparisons.")
+```
+
+The cluster signal is significant on the cleanest test controlling only for
+baseline titer (M1 to M3), on the most clinically relevant test beyond the full
+clinical model (M2 to M4), and head-to-head against all clinical covariates
+(M2 to M3). Clinical covariates alone (M1 to M2) are not significant, and add
+nothing once clusters are present (M3 to M4).
+
+# Figure 2: the four-model ladder with bootstrap confidence intervals
+
+Figure 2 pairs the absolute MSE of the four models (left) with the percent
+improvement over M1 and its recipient-clustered 95% CI (right). The confidence
+intervals are the same recipient-clustered bootstrap intervals reported in
+Table 2, so the figure and table tell one consistent story.
+
+```{r figure2, fig.width=11, fig.height=5}
+# Left panel: absolute overall MSE for each model.
+mse_df <- data.frame(model = names(model_preds),
+                     mse = sapply(model_preds, mse_of))
+mse_df$model <- factor(mse_df$model, levels = c("M1", "M2", "M3", "M4"))
+
+p_left <- ggplot(mse_df, aes(model, mse, fill = model)) +
+  geom_col(width = 0.7, color = "grey30", show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%.3f", mse)), vjust = -0.4, size = 3.5) +
+  scale_fill_brewer(palette = "Blues") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = NULL, y = "Overall test MSE", title = "A. Prediction error by model") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+# Right panel: improvement over M1 with recipient-clustered 95% CI + p-values.
+imp <- ov[ov$comparison %in% c("M1_to_M2", "M1_to_M3", "M1_to_M4"), ]
+imp$model <- c(M1_to_M2 = "M2", M1_to_M3 = "M3", M1_to_M4 = "M4")[imp$comparison]
+imp$model <- factor(imp$model, levels = c("M2", "M3", "M4"))
+
+p_right <- ggplot(imp, aes(model, delta_pct, fill = model)) +
+  geom_col(width = 0.65, color = "grey30", show.legend = FALSE) +
+  geom_errorbar(aes(ymin = ci_low_pct, ymax = ci_high_pct), width = 0.2) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_text(aes(label = sprintf("p = %.3f", p_two_sided), y = ci_high_pct + 0.8),
+            size = 3.2, color = "grey20") +
+  scale_fill_manual(values = c(M2 = "#9ecae1", M3 = "#3182bd", M4 = "#08519c")) +
+  labs(x = "Model (vs M1)", y = "MSE improvement over M1 (%)",
+       title = "B. Improvement over titers-only, recipient-clustered 95% CI") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+p_left | p_right
+```
+
+# Table 3: stratified analysis by baseline titer quartile
+
+Cellular profiling is expected to help most in patients whose pre-vaccination
+titers are low, because a high pre-vaccination titer both leaves little room for
+a fold-rise and already reflects humoral protection. To test this we split
+episodes into quartiles of the geometric-mean pre-vaccination titer across the
+three antigens, and recompute the M1 and M3 held-out MSE within each quartile.
+
+```{r table3}
+if (file.exists(STRAT_PATH)) {
+  # Load the precomputed stratification (quartile labels + per-quartile MSE).
+  load(STRAT_PATH)  # avg_baseline, quartile, stratified_mse, stratified_improvement
+} else {
+  # The quartile boundaries are derived from the mean pre-vaccination log-titer
+  # (avg_baseline), which is a function of the withheld outcome table. The
+  # per-quartile MSE is then computed from the held-out predictions above.
+  stop("Stratified analysis needs its cache (avg_baseline / quartile labels).")
+}
+
+qlev <- c("Q1_low", "Q2", "Q3", "Q4_high")
+# Titer ranges: exponentiate the log-titer quartile boundaries to recover the
+# geometric-mean HAI dilution scale reported in the manuscript.
+brks <- quantile(exp(avg_baseline), probs = c(0, .25, .5, .75, 1), na.rm = TRUE)
+mse_q <- function(pred, idx) mean((as.vector(pred[idx, ]) - as.vector(oof_Y[idx, ]))^2)
+table3 <- do.call(rbind, lapply(seq_along(qlev), function(i) {
+  idx <- which(quartile == qlev[i])
+  m1 <- mse_q(oof_pred_M1_en, idx); m3 <- mse_q(oof_pred_M3_en, idx)
+  data.frame(
+    Quartile = c("Q1 (low baseline)", "Q2", "Q3", "Q4 (high baseline)")[i],
+    `Titer range` = sprintf("%.0f-%.0f", brks[i], brks[i + 1]),
+    n = length(idx),
+    `M1 MSE` = round(m1, 3), `M3 MSE` = round(m3, 3),
+    `Improvement (%)` = round(100 * (m1 - m3) / m1, 1),
+    check.names = FALSE, row.names = NULL)
+}))
+kable(table3, caption =
+  "Table 3. Stratified prediction performance by baseline titer quartile (averaged across antigens).")
+```
+
+The gain from cellular composition is concentrated in the two lowest-titer
+quartiles -- precisely the patients at greatest clinical risk of a weak response
+-- and vanishes in the highest-titer quartile, consistent with the expected
+ceiling effect.
+
+# Supplementary table: measurement noise floor
+
+HAI titers are read in doubling dilutions with roughly one-dilution-step
+precision, so a fixed share of the outcome variance is irreducible measurement
+noise. Treating one dilution step ($\log 2$ log-units) as one standard
+deviation gives $\sigma^2_\epsilon = (\log 2)^2 \approx 0.48$ and a theoretical
+$R^2$ ceiling near 0.90. This table places the four models against that floor:
+the headline 8.7% MSE improvement corresponds to closing about 10% of the
+improvable gap between the titers-only baseline and the noise floor.
+
+```{r noise-floor}
+if (file.exists(NOISE_CSV)) {
+  noise_floor <- read.csv(NOISE_CSV)
+} else {
+  # Self-contained: everything here is a function of the held-out predictions.
+  sigma2 <- log(2)^2
+  vY <- var(as.vector(oof_Y))
+  mk <- function(pred) 1 - mse_of(pred) / vY
+  noise_floor <- data.frame(virus = "overall", var_Y = vY, sigma2_noise = sigma2,
+    R2_ceiling = 1 - sigma2 / vY,
+    mean_mse_M1 = mse_of(oof_pred_M1_en), mean_mse_M4 = mse_of(oof_pred_M4_en),
+    R2_M1 = mk(oof_pred_M1_en), R2_M4 = mk(oof_pred_M4_en))
+}
+
+nf <- noise_floor[noise_floor$virus == "overall", ]
+sigma2 <- nf$sigma2_noise
+noise_tab <- data.frame(
+  Model = c("M1 (titers only)", "M2 (titers + clinical)",
+            "M3 (titers + clusters)", "M4 (full)", "Perfect model (noise floor)"),
+  MSE = c(mse_of(oof_pred_M1_en), mse_of(oof_pred_M2_en),
+          mse_of(oof_pred_M3_en), mse_of(oof_pred_M4_en), sigma2),
+  stringsAsFactors = FALSE)
+noise_tab$RMSE <- sqrt(noise_tab$MSE)
+noise_tab$`R2` <- 1 - noise_tab$MSE / nf$var_Y
+noise_tab$`% of R2 ceiling` <- round(100 * noise_tab$`R2` / nf$R2_ceiling)
+kable(noise_tab, digits = c(0, 3, 3, 2, 0), caption =
+  "Supplementary Table. Model performance relative to the HAI noise floor.")
+```
+
+About 90% of the outcome variance is in principle explainable; the remaining
+~10% is assay noise. The current models explain 28--34% of total variance,
+leaving room for larger cohorts or richer feature sets.

@@ -1,0 +1,170 @@
+---
+title: "Marker panel reduction"
+subtitle: "Deep immune cell phenotyping predicts influenza vaccine immunogenicity in HCT recipients"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 2
+    number_sections: true
+    code_folding: show
+    self_contained: true
+    fig_width: 11
+    fig_height: 8
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 11, fig.height = 8)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(patchwork)
+})
+```
+
+# What this notebook does
+
+Mass cytometry is not widely available in clinical laboratories, so translation
+would need a smaller panel that a common spectral flow cytometer can run. This
+notebook asks how few markers can carry the predictive signal, and produces
+**Figure 7**.
+
+The test is deliberately conservative. Within each cross-validation fold, markers
+are ranked by how much they separate the meta-clusters (between-meta-cluster
+variance). At each panel size (from all 30 markers down to 6), cells are
+reassigned to their nearest full-panel cluster center using only the retained
+markers -- the cluster centers themselves are not recomputed. This measures how
+well a smaller panel approximates the full-panel clustering; a real prospective
+panel would require building the atlas from scratch on the reduced markers.
+
+Figure 7 has three panels:
+
+- **A** -- cluster preservation (the fraction of cells that keep their
+  meta-cluster) versus panel size.
+- **B** -- held-out prediction error (RMSE of the full model) versus panel size,
+  against the titers-only baseline.
+- **C** -- the top 15 markers, ranked by their consensus between-cluster
+  variance, colored by marker type.
+
+```{r paths}
+# Edit these to your local copy of the intermediate data (not distributed; see
+# README, Data Availability). The three marker-reduction tables below are
+# precomputed per-fold results; nothing here re-runs cell reassignment.
+FAST <- "/fast/datasets/flu_cellular_prediction"
+
+MR_DIR   <- file.path(FAST, "post_hoc_5000", "marker_reduction")
+PRES_CSV <- file.path(MR_DIR, "E2_preservation.csv")     # cluster preservation per fold/budget
+PERF_CSV <- file.path(MR_DIR, "E2_marker_perf.csv")      # held-out MSE per fold/budget/antigen
+RANK_CSV <- file.path(MR_DIR, "E2_marker_ranking.csv")   # marker ranking per fold
+AGG_PATH <- file.path(FAST, "per_fold_atlas_5000", "aggregated", "E2_aggregated.RData")
+```
+
+```{r load}
+if (all(file.exists(c(PRES_CSV, PERF_CSV, RANK_CSV)))) {
+  pres_dt <- fread(PRES_CSV)
+  perf_dt <- fread(PERF_CSV)
+  rank_dt <- fread(RANK_CSV)
+} else {
+  # ---- Heavy compute: for each fold and each panel size, reassign cells to the
+  #      nearest full-panel center using only the retained markers, rebuild the
+  #      CLR features, and refit the full elastic net. This needs the raw CyTOF
+  #      object and the atlas helpers (available from the corresponding author). ----
+  stop("Marker-reduction tables not found; see Data Availability.")
+}
+
+# Titers-only baseline MSE (M1), for the reference line in Panel B.
+load(AGG_PATH)             # provides overall_mse
+m1_overall <- overall_mse[["M1_en"]]
+BUDGETS <- c(30, 25, 20, 15, 12, 10, 8, 6)
+```
+
+# Figure 7
+
+```{r fig7-panelA, fig.width=6, fig.height=4.5}
+# --- Panel A: cluster preservation vs panel size (mean +/- SD across folds) ---
+pres_agg <- pres_dt[, .(mean_match = mean(meta_match), sd_match = sd(meta_match)), by = budget]
+p_a <- ggplot(pres_agg, aes(budget, 100 * mean_match)) +
+  geom_line(color = "#2166ac", linewidth = 1) +
+  geom_point(color = "#2166ac", size = 3) +
+  geom_errorbar(aes(ymin = 100 * (mean_match - sd_match), ymax = 100 * (mean_match + sd_match)),
+                width = 0.5, color = "#2166ac") +
+  geom_vline(xintercept = 15, linetype = "dashed", color = "red") +
+  scale_x_reverse(breaks = BUDGETS) +
+  labs(x = "Number of markers", y = "Cluster preservation (%)",
+       title = "A. Cluster preservation vs panel size") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+p_a
+```
+
+```{r fig7-panelB, fig.width=6, fig.height=4.5}
+# --- Panel B: held-out RMSE (full model, overall) vs panel size ---
+# Per fold/budget, the overall MSE is the mean across the three antigens.
+perf_dt[, overall_mse := mean(cluster_test_mse), by = .(fold, budget)]
+perf_agg <- unique(perf_dt[, .(fold, budget, overall_mse)])[
+  , .(mean_mse = mean(overall_mse)), by = budget]
+perf_agg[, rmse := sqrt(mean_mse)]
+rmse_baseline <- sqrt(m1_overall)
+
+p_b <- ggplot(perf_agg, aes(budget, rmse)) +
+  geom_line(color = "#d6604d", linewidth = 1) +
+  geom_point(color = "#d6604d", size = 3) +
+  geom_hline(yintercept = rmse_baseline, linetype = "dotted", color = "gray50") +
+  geom_vline(xintercept = 15, linetype = "dashed", color = "red") +
+  annotate("text", x = 28, y = rmse_baseline + 0.01, label = "M1 baseline RMSE",
+           color = "gray40", size = 3, hjust = 0) +
+  scale_x_reverse(breaks = BUDGETS) +
+  labs(x = "Number of markers", y = "Test RMSE (full model, overall)",
+       title = "B. Prediction performance vs panel size") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+p_b
+```
+
+```{r fig7-panelC, fig.width=7, fig.height=5}
+# --- Panel C: top 15 consensus markers, colored by marker type ---
+consensus <- rank_dt[, .(mean_var = mean(between_meta_var)), by = marker][order(-mean_var)]
+top15 <- consensus[1:15]
+
+# Marker-type grouping for the 15-marker panel (lineage / homing / activation /
+# differentiation), matching the manuscript's spectral-flow-compatible panel.
+marker_type <- c(
+  CD19 = "Lineage", CD20 = "Lineage", CD3 = "Lineage", CD4 = "Lineage",
+  CD8 = "Lineage", CD21 = "Lineage",
+  CXCR5 = "Homing", CCR6 = "Homing", CCR2 = "Homing",
+  `HLA-DR` = "Activation", CD86 = "Activation", CD25 = "Activation", CD38 = "Activation",
+  CD27 = "Differentiation", CD57 = "Differentiation")
+top15[, type := factor(marker_type[marker],
+                       levels = c("Lineage", "Homing", "Activation", "Differentiation"))]
+type_colors <- c(Lineage = "#2166ac", Homing = "#1a9850",
+                 Activation = "#d6604d", Differentiation = "#f4a460")
+
+p_c <- ggplot(top15, aes(reorder(marker, mean_var), mean_var, fill = type)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = type_colors, name = "Marker type") +
+  labs(x = NULL, y = "Mean between-meta-cluster variance",
+       title = "C. Consensus top 15 markers (by between-cluster variance)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "right")
+p_c
+```
+
+```{r fig7-numbers}
+cat("Cluster preservation at 30 / 15 / 12 markers (per-fold mean):\n")
+print(pres_agg[budget %in% c(30, 15, 12), .(budget, preservation_pct = round(100 * mean_match, 1))])
+cat("\nTest RMSE at 30 vs 15 markers:\n")
+print(perf_agg[budget %in% c(30, 15), .(budget, rmse = round(rmse, 3))])
+```
+
+Cluster preservation falls from 100% at the full panel to about 62% at 15
+markers and 54% at 12, yet held-out RMSE stays below the titers-only baseline at
+every panel size, because the elastic net does not depend on exact cluster
+identity. The 15-marker panel is the best trade-off, reaching the minimum RMSE.
+Its markers span lineage (CD19, CD20, CD3, CD4, CD8, CD21), homing (CXCR5,
+CCR6, CCR2), activation (HLA-DR, CD86, CD25, CD38), and differentiation (CD27,
+CD57) -- a combination practical for spectral flow cytometry.

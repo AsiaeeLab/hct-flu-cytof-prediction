@@ -1,0 +1,265 @@
+---
+title: "Cluster biology: annotation, visualization, and immune-reconstitution link"
+subtitle: "Deep immune cell phenotyping predicts influenza vaccine immunogenicity in HCT recipients"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 2
+    number_sections: true
+    code_folding: show
+    self_contained: true
+    fig_width: 10
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 7)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(knitr)
+})
+```
+
+# What this notebook does
+
+This notebook gives the meta-clusters their biological identities and shows that
+they behave like real immune-cell populations. It produces:
+
+- **Supplementary Table (meta-cluster annotations)** -- the cell-type label and
+  differentiating markers for each of the 33 meta-clusters.
+- **Figure 3** -- the UMAP embedding of all cells, colored by immune lineage.
+- **Supplementary Figure (faceted UMAP)** -- each meta-cluster highlighted
+  individually, confirming that populations occupy distinct regions.
+- **Supplementary Figure (marker heatmap)** -- the biclustered marker-expression
+  profile of each meta-cluster.
+- The **cluster-to-time-post-transplant regression**, which shows that cellular
+  composition tracks immune reconstitution.
+
+The annotations come from canonical marker combinations (CD3 for T cells,
+CD4/CD8 for the T-cell split, CD19/CD20 for B cells, CD38/CD138 for
+plasmablasts, CD57 for NK cells, HLA-DR/CD86 for antigen-presenting cells).
+Because the 30-marker panel has no dedicated myeloid markers (CD14, CD16,
+CD11c, CD123), the APC/monocyte labels are inferred by exclusion
+(CD3-CD19-HLA-DR+) and should be read with that caveat.
+
+```{r paths}
+# Edit these to your local copy of the intermediate data (not distributed; see
+# README, Data Availability). All objects below are precomputed atlas outputs;
+# nothing here re-runs clustering.
+FAST <- "/fast/datasets/flu_cellular_prediction"
+REPO <- "/home/amir/repo/flu-cellular-prediction"
+
+BIO_FILE  <- file.path(REPO, "results", "final_atlas_production", "biology_production_90203bf3.RData")
+ANN_FILE  <- file.path(REPO, "results", "reports", "cluster_annotations_corrected.csv")
+CTIME_FILE <- file.path(FAST, "post_hoc_5000", "cluster_time", "E2_cluster_time.RData")
+```
+
+```{r load}
+# --- Production-atlas biology object (cell-level UMAP + per-cluster profiles) ---
+if (file.exists(BIO_FILE)) {
+  bio <- new.env(parent = emptyenv()); load(BIO_FILE, envir = bio)
+} else {
+  stop("Biology object not found. It is produced by the production-atlas ",
+       "pipeline (notebook 01) and available from the corresponding author.")
+}
+umap_dt        <- as.data.table(bio$umap_dt)          # per-cell UMAP coordinates
+cell_meta      <- as.integer(bio$dt_keep$meta)        # per-cell meta-cluster id
+marker_profiles <- bio$marker_profiles                # 33 clusters x 30 markers (z-space mean)
+means_original <- as.data.table(bio$means_original)   # per-cluster mean on original scale
+marker_names   <- bio$marker_names
+selected_k     <- bio$selected_k
+
+# --- Curated biological annotations (cell type + broad lineage per cluster) ---
+ann <- as.data.table(read.csv(ANN_FILE, stringsAsFactors = FALSE))
+ann[, cluster_id := as.integer(cluster_id)]
+setorder(ann, cluster_id)
+```
+
+# Supplementary Table: meta-cluster annotations
+
+Each meta-cluster is labeled with its broad lineage, a cell-type name, and its
+most strongly expressed markers (mean expression on the original arcsinh scale).
+The table is grouped by lineage. Plasmablasts are listed with the B cells.
+
+```{r table-annotations}
+# Top differentiating markers per cluster, from the original-scale means.
+mo <- copy(means_original)
+mcols <- setdiff(names(mo), "meta")
+top_markers <- vapply(seq_len(nrow(mo)), function(i) {
+  vals <- unlist(mo[i, ..mcols]); vals <- sort(vals, decreasing = TRUE)[1:4]
+  paste(sprintf("%s=%.1f", names(vals), vals), collapse = ", ")
+}, character(1))
+marker_dt <- data.table(cluster_id = as.integer(mo$meta), key_markers = top_markers)
+
+# Order lineages the way the manuscript groups them.
+lin_order <- c("B cell", "Plasmablast", "CD4+ T", "CD8+ T",
+               "APC/Monocyte", "NK cell", "Other")
+annot_tab <- merge(ann[, .(cluster_id, broad_lineage, annotation)],
+                   marker_dt, by = "cluster_id")
+annot_tab[, broad_lineage := factor(broad_lineage, levels = lin_order)]
+setorder(annot_tab, broad_lineage, cluster_id)
+setnames(annot_tab, c("cluster_id", "broad_lineage", "annotation", "key_markers"),
+         c("Cluster", "Lineage", "Cell type", "Key markers (top mean expression)"))
+kable(annot_tab, caption =
+  "Supplementary Table. Biological annotation of the 33 meta-clusters.")
+```
+
+The atlas resolves coherent populations across all major lineages: CD4+ T cells,
+B cells (including follicular, germinal-center-like, transitional, and CD21-low
+subsets), CD8+ T cells, APC/monocyte populations, a plasmablast cluster, an NK
+cluster, and a set of double-negative / lineage-negative populations.
+
+# Figure 3: UMAP colored by immune lineage
+
+The UMAP places each cell in two dimensions so that cells with similar marker
+expression sit near one another. Coloring by the broad lineage of each cell's
+meta-cluster shows that the lineages occupy separate territories, and the
+numbers mark each meta-cluster's location.
+
+```{r figure3, fig.width=10, fig.height=7.5}
+lineage_colors <- c(
+  "CD4+ T" = "#1f77b4", "CD8+ T" = "#ff7f0e", "Other" = "#bcbd22",
+  "B cell" = "#2ca02c", "Plasmablast" = "#d62728", "NK cell" = "#9467bd",
+  "APC/Monocyte" = "#8c564b")
+
+plot_dt <- cbind(data.table(meta = cell_meta), umap_dt)
+plot_dt <- merge(plot_dt, ann[, .(cluster_id, annotation, broad_lineage)],
+                 by.x = "meta", by.y = "cluster_id", all.x = TRUE)
+# One label per cluster, placed at the cluster's median UMAP location.
+label_dt <- plot_dt[, .(UMAP1 = median(UMAP1), UMAP2 = median(UMAP2)), by = meta]
+
+ggplot(plot_dt, aes(UMAP1, UMAP2, color = broad_lineage)) +
+  geom_point(size = 0.1, alpha = 0.3) +
+  geom_text(data = label_dt, aes(UMAP1, UMAP2, label = meta), size = 2.7,
+            fontface = "bold", color = "black", inherit.aes = FALSE) +
+  scale_color_manual(values = lineage_colors, name = "Lineage") +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  labs(title = "UMAP of CyTOF cells, colored by immune lineage") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "right")
+```
+
+# Supplementary Figure: faceted UMAP
+
+Highlighting one meta-cluster at a time (red) against the full atlas (gray)
+confirms that each population is spatially coherent rather than scattered. For
+rendering speed the gray background is drawn from a uniform random subsample of
+cells; the highlighted cells are shown in full.
+
+```{r faceted-umap, fig.width=14, fig.height=13}
+set.seed(1)
+# Uniform subsample of the background for a lighter figure (visualization only).
+bg_idx <- sample.int(nrow(plot_dt), min(60000L, nrow(plot_dt)))
+bg <- plot_dt[bg_idx, .(UMAP1, UMAP2)]
+
+facet_dt <- rbindlist(lapply(sort(unique(plot_dt$meta)), function(cl) {
+  hi <- plot_dt[meta == cl, .(UMAP1, UMAP2)]
+  lab <- sprintf("%d: %s", cl, ann[cluster_id == cl, annotation])
+  rbind(
+    data.table(UMAP1 = bg$UMAP1, UMAP2 = bg$UMAP2, highlight = "other", label = lab),
+    data.table(UMAP1 = hi$UMAP1, UMAP2 = hi$UMAP2, highlight = "selected", label = lab))
+}))
+lab_levels <- sprintf("%d: %s", sort(unique(plot_dt$meta)),
+                      ann[match(sort(unique(plot_dt$meta)), cluster_id), annotation])
+facet_dt[, label := factor(label, levels = lab_levels)]
+
+ggplot(facet_dt, aes(UMAP1, UMAP2)) +
+  geom_point(data = facet_dt[highlight == "other"], color = "gray85",
+             size = 0.05, alpha = 0.25) +
+  geom_point(data = facet_dt[highlight == "selected"], color = "#d62728",
+             size = 0.15, alpha = 0.7) +
+  facet_wrap(~ label, ncol = 6) +
+  labs(title = "UMAP with each meta-cluster highlighted") +
+  theme_minimal(base_size = 9) +
+  theme(strip.text = element_text(face = "bold", size = 7),
+        axis.text = element_blank(), axis.ticks = element_blank(),
+        panel.grid = element_blank())
+```
+
+# Supplementary Figure: biclustered marker heatmap
+
+Averaging each marker's expression across the cells in a meta-cluster, then
+z-scoring across clusters, gives a compact fingerprint of every population.
+Hierarchical clustering of both axes reveals block structure: B-cell markers
+co-cluster, T-cell markers co-cluster, and activation markers form their own
+block.
+
+```{r heatmap, fig.width=10, fig.height=12}
+# marker_profiles: rows = clusters (z-space means), cols = markers. Z-score each
+# marker across clusters so the color scale is comparable between markers.
+mp <- as.data.table(marker_profiles)
+mp[, cluster_id := as.integer(gsub("cluster_", "", rownames(marker_profiles)))]
+mcols <- setdiff(names(mp), "cluster_id")
+for (m in mcols) mp[, (m) := (get(m) - mean(get(m))) / max(sd(get(m)), 1e-8)]
+
+heat_mat <- as.matrix(mp[, ..mcols])
+rownames(heat_mat) <- sprintf("C%d %s", mp$cluster_id,
+                              ann[match(mp$cluster_id, cluster_id), annotation])
+row_order <- rownames(heat_mat)[hclust(dist(heat_mat), "ward.D2")$order]
+col_order <- colnames(heat_mat)[hclust(dist(t(heat_mat)), "ward.D2")$order]
+
+heat_long <- melt(mp, id.vars = "cluster_id", variable.name = "marker",
+                  value.name = "z")
+heat_long[, label := sprintf("C%d %s", cluster_id,
+                             ann[match(cluster_id, cluster_id), annotation])]
+heat_long[, label := factor(label, levels = rev(row_order))]
+heat_long[, marker := factor(marker, levels = col_order)]
+
+ggplot(heat_long, aes(marker, label, fill = z)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                       midpoint = 0, limits = c(-2.5, 2.5),
+                       oob = scales::squish, name = "Z-score") +
+  labs(title = "Meta-cluster marker profiles (z-scored, biclustered)",
+       x = "Marker", y = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        axis.text.y = element_text(size = 7),
+        plot.title = element_text(face = "bold"))
+```
+
+# Cluster biology as an immune-reconstitution proxy
+
+If the meta-clusters capture immune reconstitution, cellular composition should
+predict how long ago a patient was transplanted. Regressing time since
+transplant on the CLR composition features quantifies this.
+
+```{r cluster-time}
+if (file.exists(CTIME_FILE)) {
+  # Load the precomputed regression of time-post-transplant on composition.
+  ct <- new.env(parent = emptyenv()); load(CTIME_FILE, envir = ct)
+  cluster_time_df <- ct$cluster_time_df
+  r2 <- ct$fit_time_summary$r.squared
+  adj_r2 <- ct$fit_time_summary$adj.r.squared
+} else {
+  # Self-contained given the composition features and the time covariate.
+  stop("Cluster-time regression cache not found (needs time-post-transplant).")
+}
+
+cat(sprintf("Variance in time post-transplant explained by composition: R2 = %.3f (adj. R2 = %.3f)\n",
+            r2, adj_r2))
+
+# Strongest individual cluster-time associations (by |Spearman rho|). The
+# cluster column is like "cluster_3"; map it to the integer id for the labels.
+ct_show <- as.data.table(cluster_time_df)
+ct_show[, cluster_id := as.integer(sub("cluster_", "", cluster))]
+ct_show <- merge(ct_show, ann[, .(cluster_id, annotation)], by = "cluster_id")
+ct_out <- ct_show[order(-abs(spearman_rho))][1:8,
+  .(Cluster = cluster_id, `Cell type` = annotation,
+    `Spearman rho` = round(spearman_rho, 3),
+    `p` = signif(spearman_p, 2))]
+kable(ct_out, caption =
+  "Strongest associations between meta-cluster composition and time post-transplant.")
+```
+
+Composition explains `r sprintf("%.1f%%", 100*r2)` of the variance in time since
+transplant. The strongest associations are a CD38+ lineage-negative population
+and an HLA-DR+CD86+ dendritic-cell-like APC, both more abundant early after
+transplant. The meta-clusters therefore carry genuine immune-reconstitution
+information, linking cellular composition to the vaccine response.

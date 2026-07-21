@@ -1,0 +1,226 @@
+---
+title: "Per-cohort analysis and cross-cohort transfer"
+subtitle: "Deep immune cell phenotyping predicts influenza vaccine immunogenicity in HCT recipients"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 2
+    number_sections: true
+    code_folding: show
+    self_contained: true
+    fig_width: 10
+    fig_height: 8
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 8)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(patchwork)
+  library(knitr)
+})
+```
+
+# What this notebook does
+
+The two trials enrolled different populations (pediatric versus adult) at
+different transplant centers, so pooling them requires the cellular signature to
+behave consistently across cohorts. This notebook examines that in three ways
+and adds a transfer diagnostic. It produces:
+
+- **Figure 5** -- per-cohort predictive gain, per-cohort feature selection, and
+  per-cohort baseline-titer stratification.
+- **Supplementary Figure (cross-cohort transfer)** -- what happens when a model
+  trained on one cohort is applied to the other.
+
+The four-model ladder is refit independently within each cohort, using the same
+production atlas, the same recipient-grouped nested cross-validation, and the
+same recipient-clustered bootstrap as the pooled analysis.
+
+```{r paths}
+# Edit these to your local copy of the intermediate data (not distributed; see
+# README, Data Availability).
+FAST <- "/fast/datasets/flu_cellular_prediction"
+REPO <- "/home/amir/repo/flu-cellular-prediction"
+
+PC_DIR    <- file.path(FAST, "post_hoc_5000", "per_cohort")
+PC_RDATA  <- file.path(PC_DIR, "E5_per_cohort.RData")
+BOOT_PATH <- file.path(FAST, "post_hoc_5000", "recipient_bootstrap", "E3_recipient_boot.RData")
+ATLAS_FILE <- file.path(REPO, "results", "final_atlas_production", "final_atlas_e862228d.RData")
+ANN_FILE  <- file.path(REPO, "results", "reports", "cluster_annotations_corrected.csv")
+```
+
+```{r load}
+if (file.exists(PC_RDATA)) {
+  # Load the per-cohort refit results (fast; the nested CV was already run).
+  pc <- new.env(parent = emptyenv()); load(PC_RDATA, envir = pc)
+  per_cohort_summary <- fread(file.path(PC_DIR, "E5_summary.csv"))   # peds/adult gains
+  sel_summary <- as.data.table(pc$sel_summary)                       # feature selection
+  strat_all   <- as.data.table(pc$strat_all)                         # per-cohort quartiles
+} else {
+  # ---- Heavy compute: refit the four-model ladder within each cohort with
+  #      recipient-grouped nested CV and recipient-clustered bootstrap. This
+  #      needs the raw CyTOF object and the atlas helpers (available from the
+  #      corresponding author); it is the per-cohort analog of notebooks 01-02. ----
+  stop("Per-cohort refit results not found. Rebuild with the per-cohort ",
+       "pipeline (needs raw data + helpers).")
+}
+
+# Pooled reference values come from the recipient-clustered bootstrap (Table 2),
+# so Figure 5A shows the pooled estimate on the same footing as the per-cohort ones.
+boot <- new.env(parent = emptyenv()); load(BOOT_PATH, envir = boot)
+pool <- as.data.frame(boot$results_df)
+pool <- pool[pool$scope == "overall" & pool$comparison %in% c("M1_to_M3", "M2_to_M4"), ]
+pooled <- data.table(cohort = "pooled", comparison = pool$comparison,
+                     delta_pct = pool$delta_pct, ci_low = pool$ci_low_pct,
+                     ci_high = pool$ci_high_pct, p_two_sided = pool$p_two_sided)
+
+ann <- as.data.table(read.csv(ANN_FILE, stringsAsFactors = FALSE))
+ann[, cluster_id := as.integer(cluster_id)]
+ann[, short := trimws(gsub("\\s+", " ", gsub("\\s*\\(.*?\\)", "", annotation)))]
+```
+
+# Figure 5
+
+```{r fig5-panelA, fig.width=9, fig.height=4}
+# --- Panel A: per-cohort MSE improvement with the pooled estimate alongside ---
+summary_all <- rbind(per_cohort_summary, pooled, fill = TRUE)
+summary_all[, cohort := factor(cohort, levels = c("peds", "adult", "pooled"),
+  labels = c("Pediatric (n=187 ep)", "Adult (n=156 ep)", "Pooled (n=343 ep)"))]
+summary_all[, comparison := factor(comparison, levels = c("M1_to_M3", "M2_to_M4"),
+  labels = c("M1 -> M3 (clusters over titers)", "M2 -> M4 (clusters over clinical)"))]
+
+cohort_colors <- c("Pediatric (n=187 ep)" = "#2166ac",
+                   "Adult (n=156 ep)" = "#d6604d", "Pooled (n=343 ep)" = "#4d4d4d")
+p_a <- ggplot(summary_all, aes(cohort, delta_pct, fill = cohort)) +
+  geom_col(width = 0.6, color = "black", linewidth = 0.3) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.18) +
+  geom_hline(yintercept = 0, color = "gray30", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("p = %.3f", p_two_sided), y = ci_high + 1.5),
+            size = 2.8, color = "gray20") +
+  facet_wrap(~ comparison, nrow = 1) +
+  scale_fill_manual(values = cohort_colors, guide = "none") +
+  labs(title = "A. Per-cohort MSE improvement, pooled estimate alongside",
+       subtitle = "Recipient-clustered bootstrap, B = 2,000; whiskers 95% CI",
+       x = NULL, y = "MSE improvement (%)") +
+  theme_bw(base_size = 9.5) +
+  theme(plot.title = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(color = "gray30", size = 9),
+        strip.background = element_rect(fill = "gray92"))
+p_a
+```
+
+```{r fig5-panelB, fig.width=9, fig.height=6}
+# --- Panel B: per-cohort selection frequency of the top cluster features ---
+# Drop the three baseline titers (selected in 100% of bootstraps in both cohorts).
+sel <- sel_summary[!grepl("^baseline_", feature)]
+sel[, cluster_id := as.integer(sub("cluster_", "", feature))]
+short_lu <- setNames(ann$short, as.character(ann$cluster_id))
+sel[, label := sprintf("C%d: %s", cluster_id, short_lu[as.character(cluster_id)])]
+sel[, max_freq := pmax(peds_freq, adult_freq)]
+setorder(sel, -max_freq)
+top18 <- sel[1:18]
+
+sel_long <- melt(top18[, .(label, peds_freq, adult_freq)], id.vars = "label",
+                 variable.name = "cohort_var", value.name = "freq")
+sel_long[, cohort := factor(cohort_var, levels = c("peds_freq", "adult_freq"),
+                            labels = c("Pediatric", "Adult"))]
+sel_long[, label := factor(label, levels = rev(top18$label))]
+
+p_b <- ggplot(sel_long, aes(freq, label, fill = cohort)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65,
+           color = "gray30", linewidth = 0.2) +
+  geom_vline(xintercept = 0.5, color = "red", linetype = "dashed", linewidth = 0.3) +
+  scale_fill_manual(values = c("Pediatric" = "#2166ac", "Adult" = "#d6604d"), name = NULL) +
+  scale_x_continuous(limits = c(0, 1.02), expand = expansion(0.01)) +
+  labs(title = "B. Per-cohort feature selection frequency (top 18 clusters)",
+       subtitle = "Bootstrap stability (B = 200) of the M3 fit at the pooled lambda",
+       x = "Selection frequency", y = NULL) +
+  theme_bw(base_size = 9) +
+  theme(plot.title = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(color = "gray30", size = 9),
+        legend.position = "bottom", axis.text.y = element_text(size = 7))
+p_b
+```
+
+```{r fig5-panelC, fig.width=9, fig.height=4}
+# --- Panel C: per-cohort baseline-titer quartile stratification (M1 -> M3) ---
+strat_all[, cohort_lbl := factor(cohort, levels = c("peds", "adult"),
+                                 labels = c("Pediatric", "Adult"))]
+p_c <- ggplot(strat_all, aes(quartile, improvement_pct, fill = cohort_lbl)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6,
+           color = "gray30", linewidth = 0.3) +
+  geom_hline(yintercept = 0, color = "gray30", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("n=%d", n),
+                y = ifelse(improvement_pct >= 0, improvement_pct + 1.5, improvement_pct - 1.5)),
+            position = position_dodge(width = 0.7), size = 2.6, color = "gray25") +
+  scale_fill_manual(values = c("Pediatric" = "#2166ac", "Adult" = "#d6604d"), name = NULL) +
+  labs(title = "C. Per-cohort baseline-titer quartile stratification (M1 -> M3)",
+       subtitle = "Quartiles within each cohort; n = episodes per cell",
+       x = "Baseline titer quartile (within cohort)", y = "MSE improvement (%)") +
+  theme_bw(base_size = 9.5) +
+  theme(plot.title = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(color = "gray30", size = 9), legend.position = "bottom")
+p_c
+```
+
+Refitting the ladder separately gives improvements in the same direction in both
+cohorts, with the pooled estimate lying between them (Panel A). The most
+predictive features are largely shared between cohorts (Panel B); only two
+features diverge, consistent with cohort-specific reconstitution biology. The
+adult cohort shows the largest gain in the lowest titer quartile seen in the
+pooled analysis, whereas pediatric gains are more uniform across quartiles
+(Panel C).
+
+# Supplementary Figure: cross-cohort transfer
+
+A stronger test of a shared signature is transfer: train the cluster model on
+one cohort and evaluate it, untouched, on the other. A negative percent change
+in MSE means the cluster features still help in the new cohort.
+
+```{r transfer, fig.width=9, fig.height=5}
+if (file.exists(ATLAS_FILE)) {
+  # The transfer diagnostic is precomputed and stored in the production atlas.
+  atlas <- new.env(parent = emptyenv()); load(ATLAS_FILE, envir = atlas)
+  transfer_dt <- as.data.table(atlas$transfer_dt)
+} else {
+  stop("Production atlas (with transfer_dt) not found; see Data Availability.")
+}
+
+transfer_dt[, direction_label := fifelse(direction == "peds_to_adult",
+  sprintf("Peds -> Adult (train %d, test %d)", n_train, n_test),
+  sprintf("Adult -> Peds (train %d, test %d)", n_train, n_test))]
+transfer_dt[, virus_label := factor(virus, levels = c("h1n1", "h3n2", "bvic"),
+                                    labels = c("H1N1", "H3N2", "B/Vic"))]
+# Report as MSE reduction (positive = clusters help), i.e. minus the raw change.
+transfer_dt[, mse_reduction := -improve_pct]
+
+ggplot(transfer_dt, aes(virus_label, mse_reduction, fill = direction_label)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, alpha = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = sprintf("%.1f%%", mse_reduction)),
+            position = position_dodge(width = 0.7), vjust = -0.4, size = 3) +
+  scale_fill_brewer(palette = "Set2", name = "Transfer direction") +
+  labs(title = "Cross-cohort transfer: MSE reduction from cluster features",
+       subtitle = "Positive = clusters improve prediction in the held-out cohort",
+       x = "Antigen", y = "MSE reduction (%)") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+
+kable(transfer_dt[, .(Direction = direction, Antigen = toupper(virus),
+                      `Baseline MSE` = round(baseline_mse, 3),
+                      `Clusters MSE` = round(clusters_mse, 3),
+                      `MSE reduction (%)` = round(mse_reduction, 1))],
+      caption = "Cross-cohort transfer: cluster features vs baseline in the held-out cohort.")
+```
+
+A model trained on pediatric recipients transfers well to adults (13--37% MSE
+reduction across antigens), whereas the reverse direction gains only 1--3%. The
+asymmetry is consistent with the pediatric cohort spanning greater diversity in
+early immune reconstitution, which generalizes to the adult range.

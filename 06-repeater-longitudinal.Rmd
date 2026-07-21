@@ -1,0 +1,298 @@
+---
+title: "Longitudinal analysis in two-episode (repeater) recipients"
+subtitle: "Deep immune cell phenotyping predicts influenza vaccine immunogenicity in HCT recipients"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 2
+    number_sections: true
+    code_folding: show
+    self_contained: true
+    fig_width: 10
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 7)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(patchwork)
+  library(knitr)
+})
+```
+
+# What this notebook does
+
+Eighty recipients were vaccinated in two consecutive years, giving a
+within-recipient view of how cellular composition and antibody response change
+over time. The cross-sectional analysis (notebooks 01--02) treated every episode
+independently; here we ask whether the longitudinal changes are consistent with
+what the cross-sectional model learned. This notebook produces:
+
+- **Figure 6** -- the year-over-year change in how many antigens each recipient
+  responds to.
+- **Supplementary Figure (reconstitution schematic)** -- a conceptual picture of
+  the hypothesized shift from an early-reconstitution to a mature-response
+  phenotype.
+- **Supplementary Figure (PCA trajectories)** -- repeater trajectories in the
+  principal-component space of the composition features.
+- **Supplementary Figure (per-cluster change)** -- which populations move between
+  years, by H3N2 transition group.
+- **Supplementary Figure (predicted-response scatter)** -- the cross-sectional
+  M3 model's predicted H3N2 fold-rise in year 1 versus year 2.
+
+Responders are defined per episode and antigen by the conventional four-fold
+seroconversion threshold ($y \geq \log 4$). Each recipient's H3N2 trajectory is
+coded as one of four transition states: non-responder to responder (NR to R),
+responder to responder (R to R), non-responder to non-responder (NR to NR), and
+responder to non-responder (R to NR). These results are supportive rather than
+primary: the subset is small and the labels rely on a single threshold.
+
+```{r paths}
+# Edit these to your local copy of the intermediate data (not distributed; see
+# README, Data Availability). The repeater workspace is a precomputed post-hoc
+# object; nothing here re-runs clustering or model fitting.
+FAST <- "/fast/datasets/flu_cellular_prediction"
+REPO <- "/home/amir/repo/flu-cellular-prediction"
+
+REP_RDATA <- file.path(FAST, "post_hoc_5000", "repeater_analysis", "E4_repeater_workspace.RData")
+ANN_FILE  <- file.path(REPO, "results", "reports", "cluster_annotations_corrected.csv")
+
+LOG_FOURFOLD <- log(4)   # four-fold seroconversion threshold on the log scale
+trans_colors <- c("NR -> R" = "#2ca02c", "R -> R" = "#1f77b4",
+                  "NR -> NR" = "#d6604d", "R -> NR" = "#762a83")
+trans_levels <- c("NR -> R", "R -> R", "NR -> NR", "R -> NR")
+```
+
+```{r load}
+if (file.exists(REP_RDATA)) {
+  # Load the repeater workspace: per-episode table, per-recipient wide table,
+  # per-cluster year-over-year change, and the PCA of the composition features.
+  rep_env <- new.env(parent = emptyenv()); load(REP_RDATA, envir = rep_env)
+} else {
+  # ---- Self-contained given the composition features, the held-out M3
+  #      predictions, and the outcomes -- all cached intermediates. The driver
+  #      identifies the 80 two-episode recipients, labels responders at the
+  #      four-fold threshold, and computes transitions, per-cluster deltas, and
+  #      the composition PCA. ----
+  stop("Repeater workspace not found; see Data Availability.")
+}
+rep_wide      <- as.data.table(rep_env$rep_wide)        # 80 recipients (one row each)
+delta_summary <- as.data.table(rep_env$delta_summary)  # per-cluster year-over-year change
+pca           <- rep_env$pca                            # PCA of composition features
+expl          <- rep_env$expl                           # variance explained (%)
+
+ann <- as.data.table(read.csv(ANN_FILE, stringsAsFactors = FALSE))
+ann[, cluster_id := as.integer(cluster_id)]
+rep_wide[, trans_h3n2 := factor(trans_h3n2, levels = trans_levels)]
+```
+
+# Figure 6: change in number of antigens responded to
+
+Each recipient responds to 0--3 antigens in each episode. This heatmap counts
+recipients by their year-1 response count (horizontal) versus year-2 count
+(vertical). Cells above the diagonal (more antigens in year 2) outnumber those
+below, consistent with progressive immune reconstitution between episodes.
+
+```{r figure6, fig.width=6.5, fig.height=5.5}
+count_dt <- rep_wide[, .N, by = .(n_responded_1, n_responded_2)]
+ggplot(count_dt, aes(factor(n_responded_1), factor(n_responded_2), fill = N)) +
+  geom_tile() +
+  geom_text(aes(label = N), color = "white", size = 4.5, fontface = "bold") +
+  scale_fill_gradient(low = "#deebf7", high = "#08306b") +
+  labs(title = "Number of antigens responded to: year 1 -> year 2",
+       subtitle = sprintf("Four-fold seroconversion; %d two-episode recipients", nrow(rep_wide)),
+       x = "Year 1: number of antigens responded", y = "Year 2: number of antigens responded") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "none")
+```
+
+```{r figure6-summary}
+# Net movement across all three antigens, year 1 -> year 2.
+rep_wide[, gained := n_responded_2 - n_responded_1]
+cat("Recipients gaining >= 1 responding antigen:", rep_wide[gained > 0, .N], "\n")
+cat("Recipients losing >= 1 responding antigen: ", rep_wide[gained < 0, .N], "\n")
+cat("Recipients moving from 0 to 3 responding antigens:",
+    rep_wide[n_responded_1 == 0 & n_responded_2 == 3, .N], "\n")
+```
+
+More recipients gain than lose responding antigens between episodes, and a
+notable group moves from zero to all three -- the largest single off-diagonal
+cell.
+
+# Supplementary Figure: conceptual reconstitution schematic
+
+This is a hypothesis illustration, not a data plot. It sketches how cellular
+composition is thought to shift from an early-reconstitution phenotype (many
+immature, lineage-negative, and activated APC populations in a small total
+compartment) toward a mature-response phenotype (expanded B-cell, plasmablast,
+and memory T-cell populations). Bar width represents the total circulating cell
+mass, which grows across the trajectory.
+
+```{r cartoon, fig.width=10, fig.height=5.5}
+cat_colors <- c("Mature B / memory B" = "#08519c", "Activated follicular B" = "#3182bd",
+  "Plasmablast" = "#6baed6", "CD4+ memory T" = "#fd8d3c", "CD8+ memory T" = "#fb6a4a",
+  "Activated APC" = "#fdae6b", "Immature / DN" = "#737373", "Lineage-negative" = "#bdbdbd")
+cat_levels <- c("Immature / DN", "Lineage-negative", "Activated APC",
+                "Activated follicular B", "Mature B / memory B", "Plasmablast",
+                "CD4+ memory T", "CD8+ memory T")
+stages <- list(
+  list(label = "Early reconstitution\n(non-responder phenotype)", x = 1, half_w = 0.20,
+       comp = c(28, 22, 14, 6, 8, 2, 12, 8)),
+  list(label = "Intermediate", x = 2, half_w = 0.35,
+       comp = c(18, 14, 14, 12, 14, 4, 14, 10)),
+  list(label = "Mature response capacity\n(responder phenotype)", x = 3, half_w = 0.50,
+       comp = c(8, 6, 12, 16, 22, 6, 18, 12)))
+rect_dt <- rbindlist(lapply(stages, function(s) {
+  pct <- setNames(s$comp, cat_levels)[cat_levels]
+  data.table(stage = s$label, xmin = s$x - s$half_w, xmax = s$x + s$half_w,
+             ymin = cumsum(c(0, pct[-length(pct)])), ymax = cumsum(pct), category = cat_levels)
+}))
+rect_dt[, category := factor(category, levels = cat_levels)]
+stage_labels <- vapply(stages, function(s) s$label, character(1))
+arrows_dt <- data.table(x1 = c(1.25, 2.4), x2 = c(1.65, 2.5), y = c(108, 108),
+  label = c("year 1 -> year 2 in many\nNR -> R repeaters",
+            "expansion of mature B-cell\nand T-memory populations"))
+
+ggplot() +
+  geom_rect(data = rect_dt, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax,
+                                fill = category), color = "white", linewidth = 0.3) +
+  geom_segment(data = arrows_dt, aes(x = x1, xend = x2, y = y, yend = y),
+               arrow = arrow(length = unit(0.18, "cm"), type = "closed"),
+               color = "gray30", linewidth = 0.5) +
+  geom_text(data = arrows_dt, aes((x1 + x2) / 2, y + 6, label = label),
+            color = "gray25", size = 2.7, lineheight = 0.95) +
+  scale_x_continuous(breaks = 1:3, labels = stage_labels, limits = c(0.4, 3.6)) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.05)), limits = c(0, 124)) +
+  scale_fill_manual(values = cat_colors, name = NULL, breaks = cat_levels) +
+  labs(title = "Conceptual immune reconstitution trajectory in HCT repeaters",
+       subtitle = "Bar width proportional to total cell mass; height = composition (%)",
+       x = NULL, y = "Composition (%)") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "right", legend.text = element_text(size = 8),
+        axis.text.x = element_text(size = 9), plot.margin = margin(15, 6, 6, 6),
+        panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank())
+```
+
+# Supplementary Figure: repeater trajectories in composition PCA
+
+Projecting every episode into the principal-component space of the composition
+features, each repeater's two episodes are joined by an arrow (year 1 to year 2)
+and the panels are split by H3N2 transition group. Gray points are the
+non-repeater background. Trajectories overlap across groups and do not collapse
+onto a single axis of motion.
+
+```{r pca-trajectories, fig.width=12, fig.height=4.5}
+scores <- as.data.table(pca$x[, 1:3])
+scores[, obs_id := rownames(pca$x)]
+scores[, base_id := sub("_yr[0-9]+$", "", obs_id)]
+scores[, year_abs := as.integer(sub(".*_yr", "", obs_id))]
+repeaters <- rep_wide$base_id
+scores[, is_repeater := base_id %in% repeaters]
+scores[is_repeater == TRUE, episode_order := frank(year_abs, ties.method = "first"), by = base_id]
+scores[is_repeater == FALSE, episode_order := 1L]
+scores <- merge(scores, rep_wide[, .(base_id, trans_h3n2)], by = "base_id", all.x = TRUE)
+
+bg <- scores[is_repeater == FALSE]; fg <- scores[is_repeater == TRUE]
+ggplot() +
+  geom_point(data = bg, aes(PC1, PC2), color = "gray88", size = 0.5) +
+  geom_path(data = fg[order(base_id, episode_order)],
+            aes(PC1, PC2, group = base_id, color = trans_h3n2),
+            arrow = arrow(length = unit(0.16, "cm"), type = "closed"),
+            linewidth = 0.55, alpha = 0.9) +
+  geom_point(data = fg, aes(PC1, PC2, color = trans_h3n2, shape = factor(episode_order)),
+             size = 1.6) +
+  scale_color_manual(values = trans_colors, name = "H3N2 transition", guide = "none") +
+  scale_shape_manual(values = c("1" = 16, "2" = 17), name = "Episode") +
+  facet_wrap(~ trans_h3n2, ncol = 4) +
+  labs(title = "Repeater trajectories in composition PCA, by H3N2 transition group",
+       subtitle = sprintf("%d repeaters; arrows show year 1 -> year 2; gray = non-repeater background",
+                          length(repeaters)),
+       x = sprintf("PC1 (%.1f%%)", expl[1]), y = sprintf("PC2 (%.1f%%)", expl[2])) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "bottom", strip.background = element_rect(fill = "gray95"))
+```
+
+# Supplementary Figure: per-cluster change between episodes
+
+For each meta-cluster we take the mean year-over-year change in CLR composition,
+by H3N2 transition group (error bars are one standard error). Only clusters with
+substantial movement are shown.
+
+```{r cluster-delta, fig.width=9, fig.height=8}
+top_movers <- delta_summary[!is.na(trans_h3n2),
+  .(rng = max(abs(mean_delta))), by = cluster_id][rng > 0.15, cluster_id]
+delta_top <- delta_summary[cluster_id %in% top_movers & !is.na(trans_h3n2)]
+delta_top[, trans_h3n2 := factor(trans_h3n2, levels = trans_levels)]
+
+ggplot(delta_top, aes(mean_delta, reorder(label, mean_delta), color = trans_h3n2)) +
+  geom_point(size = 2.6, position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = mean_delta - se_delta, xmax = mean_delta + se_delta),
+                 position = position_dodge(width = 0.5), height = 0.25) +
+  geom_vline(xintercept = 0, color = "gray40", linetype = "dashed") +
+  scale_color_manual(values = trans_colors, name = "H3N2 transition") +
+  labs(title = "Per-cluster CLR change (year 1 -> year 2), by H3N2 transition",
+       subtitle = "Most-moving clusters; positive = increased in year 2",
+       x = "Mean CLR change (year 2 - year 1)", y = NULL) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "bottom", axis.text.y = element_text(size = 7))
+```
+
+Activated follicular B cells and the plasmablast cluster tend to increase more in
+the NR-to-R group than in recipients who stay non-responders, while activated
+lineage-negative and APC/monocyte populations decrease across most groups --
+the same direction as the cross-sectional feature associations.
+
+# Supplementary Figure: cross-sectional M3 prediction, year 1 vs year 2
+
+Scoring each repeater episode with the cross-sectional M3 model (which never saw
+the longitudinal pairing), we plot the predicted H3N2 fold-rise in year 1 versus
+year 2. Points above the diagonal are recipients the model predicts will respond
+more strongly in year 2. Ellipses are 68% concentration regions per observed
+transition group.
+
+```{r risk-scatter, fig.width=8, fig.height=7}
+# Agreement between the model's predicted transition (thresholding each year's
+# prediction at log 4) and the observed transition.
+rep_wide[, pred_trans := fcase(
+  pred_M3_h3n2_1 <  LOG_FOURFOLD & pred_M3_h3n2_2 >= LOG_FOURFOLD, "NR -> R",
+  pred_M3_h3n2_1 >= LOG_FOURFOLD & pred_M3_h3n2_2 >= LOG_FOURFOLD, "R -> R",
+  pred_M3_h3n2_1 <  LOG_FOURFOLD & pred_M3_h3n2_2 <  LOG_FOURFOLD, "NR -> NR",
+  pred_M3_h3n2_1 >= LOG_FOURFOLD & pred_M3_h3n2_2 <  LOG_FOURFOLD, "R -> NR")]
+agree <- rep_wide[!is.na(trans_h3n2), mean(pred_trans == as.character(trans_h3n2))]
+
+quad <- data.table(
+  x = c(-1.5, -1.5, 4.5, 4.5), y = c(4.5, -0.7, 4.5, -0.7),
+  label = c("Predicted NR -> R", "Predicted NR -> NR", "Predicted R -> R", "Predicted R -> NR"),
+  hjust = c(0, 0, 1, 1))
+
+ggplot(rep_wide, aes(pred_M3_h3n2_1, pred_M3_h3n2_2, color = trans_h3n2, fill = trans_h3n2)) +
+  geom_hline(yintercept = LOG_FOURFOLD, color = "gray70", linetype = "dotted") +
+  geom_vline(xintercept = LOG_FOURFOLD, color = "gray70", linetype = "dotted") +
+  geom_abline(slope = 1, intercept = 0, color = "gray40", linetype = "dashed") +
+  stat_ellipse(geom = "polygon", level = 0.68, alpha = 0.18, linewidth = 0.4) +
+  geom_point(size = 2.4, alpha = 0.85) +
+  geom_text(data = quad, aes(x, y, label = label, hjust = hjust),
+            color = "gray35", size = 2.7, inherit.aes = FALSE) +
+  scale_color_manual(values = trans_colors, name = "Observed H3N2 transition", breaks = trans_levels) +
+  scale_fill_manual(values = trans_colors, name = "Observed H3N2 transition", breaks = trans_levels) +
+  labs(title = "M3 predicted H3N2 fold-rise: year 1 vs year 2",
+       subtitle = sprintf("Ellipses are 68%% regions per observed group; quadrant agreement = %.0f%%",
+                          100 * agree),
+       x = "Year 1 predicted log fold-rise", y = "Year 2 predicted log fold-rise") +
+  theme_bw(base_size = 9.5) +
+  theme(legend.position = "bottom")
+```
+
+Most NR-to-R recipients sit above the diagonal: the cross-sectional model,
+fit with no access to the longitudinal pairing, captures the same cellular
+signal that drives the observed transitions. Thresholding the prediction at
+$\log 4$ reproduces the observed transition category in
+`r sprintf("%.0f%%", 100*rep_wide[!is.na(trans_h3n2), mean(pred_trans == as.character(trans_h3n2))])`
+of repeaters, well above the 25% expected by chance.

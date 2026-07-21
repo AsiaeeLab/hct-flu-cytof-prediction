@@ -1,0 +1,319 @@
+---
+title: "Sensitivity analyses and dose-subgroup supplement"
+subtitle: "Deep immune cell phenotyping predicts influenza vaccine immunogenicity in HCT recipients"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 2
+    number_sections: true
+    code_folding: show
+    self_contained: true
+    fig_width: 11
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 11, fig.height = 6)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(patchwork)
+  library(knitr)
+})
+```
+
+# What this notebook does
+
+This notebook collects the supplementary robustness checks and the exploratory
+dose-subgroup analysis. It produces:
+
+- **Supplementary Figure (multitask vs single-task)** -- whether predicting the
+  three antigens jointly matters.
+- **Supplementary Figure (micro-cluster sensitivity)** -- 2,000 versus 5,000
+  micro-clusters.
+- **One-episode-per-recipient sensitivity** -- the headline result on the subset
+  with no repeated recipients.
+- **Interaction-rich clinical baseline** -- the cluster gain against a clinical
+  model with all pairwise interactions.
+- **Supplementary Figure (counterfactual dose subgroups)** -- a T-learner that
+  predicts each recipient's response under standard- and high-dose vaccine.
+
+```{r paths}
+# Edit these to your local copy of the intermediate data (not distributed; see
+# README, Data Availability).
+FAST <- "/fast/datasets/flu_cellular_prediction"
+REPO <- "/home/amir/repo/flu-cellular-prediction"
+
+AGG_5000  <- file.path(FAST, "per_fold_atlas_5000", "aggregated", "E2_aggregated.RData")
+AGG_2000  <- file.path(FAST, "per_fold_atlas_2000", "aggregated", "E2_aggregated.RData")
+SINGLE    <- file.path(FAST, "per_fold_atlas_5000", "aggregated", "E2_single_task.RData")
+CI_5000   <- file.path(FAST, "post_hoc_5000", "bootstrap_ci", "E2_bootstrap_ci.csv")
+CI_2000   <- file.path(FAST, "post_hoc_2000", "bootstrap_ci", "E2_bootstrap_ci.csv")
+MSE_5000  <- file.path(FAST, "per_fold_atlas_5000", "aggregated", "E2_mse_summary.csv")
+MSE_2000  <- file.path(FAST, "per_fold_atlas_2000", "aggregated", "E2_mse_summary.csv")
+SINGLE_OBS_SUM  <- file.path(FAST, "post_hoc_5000", "single_obs_sensitivity", "E3_single_obs_summary.csv")
+SINGLE_OBS_BOOT <- file.path(FAST, "post_hoc_5000", "single_obs_sensitivity", "E3_single_obs_bootstrap.csv")
+INT_M2  <- file.path(FAST, "post_hoc_5000", "interaction_baseline", "E3_interaction_M2prime.csv")
+INT_M4  <- file.path(FAST, "post_hoc_5000", "interaction_baseline", "E3_interaction_M4int.csv")
+DOSE_FILE <- file.path(REPO, "results", "final_atlas_production", "dose_causal_forest_55111d4f.RData")
+
+VIRUSES <- c("h1n1", "h3n2", "bvic")
+```
+
+# Multitask versus single-task elastic net
+
+The primary models predict the three antigen responses jointly (a multitask
+elastic net). An alternative is to fit a separate model per antigen. If the two
+give similar accuracy, the joint formulation is not driving the result.
+
+```{r single-task}
+load(AGG_5000)   # multitask held-out predictions and outcomes
+if (file.exists(SINGLE)) {
+  # Load the precomputed single-task (per-antigen) predictions and MSE summary.
+  load(SINGLE)   # provides mse_df (and oof_single_M3/M4)
+} else {
+  # ---- Self-contained refit: per-antigen elastic nets from the per-fold X/Y
+  #      matrices already stored in the fold artifacts. No raw data needed. ----
+  suppressPackageStartupMessages(library(glmnet))
+  per_fold <- file.path(FAST, "per_fold_atlas_5000", sprintf("fold_%d", 1:5),
+                        sprintf("fold_%d_all.RData", 1:5))
+  if (!all(file.exists(per_fold))) stop("Single-task cache and fold artifacts both missing.")
+  oof_single_M3 <- oof_single_M4 <- matrix(NA, nrow(oof_Y), 3, dimnames = dimnames(oof_Y))
+  for (f in seq_along(per_fold)) {
+    e <- new.env(parent = emptyenv()); load(per_fold[f], envir = e)
+    ti <- match(e$test_p_ids, common_p_ids)
+    for (v in VIRUSES) {
+      set.seed(7100 + f * 100 + which(VIRUSES == v))
+      m3 <- cv.glmnet(e$X_M3_train, e$Y_train[, v], family = "gaussian", alpha = 0.9, nfolds = 5)
+      oof_single_M3[ti, v] <- as.numeric(predict(m3, e$X_M3_test, s = "lambda.min"))
+      set.seed(7100 + f * 100 + which(VIRUSES == v) + 10)
+      m4 <- cv.glmnet(e$X_M4_train, e$Y_train[, v], family = "gaussian", alpha = 0.9, nfolds = 5)
+      oof_single_M4[ti, v] <- as.numeric(predict(m4, e$X_M4_test, s = "lambda.min"))
+    }
+  }
+  cmse <- function(P, lab) data.frame(model = lab, virus = c(VIRUSES, "overall"),
+    mse = c(sapply(VIRUSES, function(v) mean((oof_Y[, v] - P[, v])^2)), mean((oof_Y - P)^2)))
+  mse_df <- rbind(cmse(oof_pred_M1_en, "M1_multi"), cmse(oof_pred_M3_en, "M3_multi"),
+                  cmse(oof_pred_M4_en, "M4_multi"), cmse(oof_single_M3, "M3_single"),
+                  cmse(oof_single_M4, "M4_single"))
+}
+mse_df <- as.data.table(mse_df)
+
+m1 <- mse_df[model == "M1_multi" & virus == "overall", mse]
+plot_df <- mse_df[virus == "overall" & model != "M1_multi"]
+plot_df[, task := ifelse(grepl("multi", model), "Multitask", "Single-task")]
+plot_df[, model_base := sub("_.*", "", model)]
+plot_df[, improvement := 100 * (1 - mse / m1)]
+
+p1 <- ggplot(plot_df, aes(model_base, improvement, fill = task)) +
+  geom_col(position = position_dodge(width = 0.6), width = 0.5) +
+  geom_text(aes(label = sprintf("%.1f%%", improvement)),
+            position = position_dodge(width = 0.6), vjust = -0.3, size = 3.5) +
+  scale_fill_manual(values = c("Multitask" = "#2166ac", "Single-task" = "#92c5de"), name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = "MSE improvement (%) over M1", title = "A. Multitask vs single-task (overall)") +
+  theme_minimal(base_size = 12) + theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+
+pv <- mse_df[model %in% c("M3_multi", "M3_single") & virus != "overall"]
+pv[, task := ifelse(grepl("multi", model), "Multitask", "Single-task")]
+pv_m1 <- mse_df[model == "M1_multi" & virus != "overall", .(virus, mse_m1 = mse)]
+pv <- merge(pv, pv_m1, by = "virus")
+pv[, improvement := 100 * (1 - mse / mse_m1)]
+pv[, virus_label := factor(virus, levels = VIRUSES, labels = c("H1N1", "H3N2", "B/Vic"))]
+
+p2 <- ggplot(pv, aes(virus_label, improvement, fill = task)) +
+  geom_col(position = position_dodge(width = 0.6), width = 0.5) +
+  geom_text(aes(label = sprintf("%.1f%%", improvement)),
+            position = position_dodge(width = 0.6), vjust = -0.3, size = 3.5) +
+  scale_fill_manual(values = c("Multitask" = "#2166ac", "Single-task" = "#92c5de"), name = NULL) +
+  labs(x = NULL, y = "MSE improvement (%) over M1", title = "B. M3 (titers + clusters): per antigen") +
+  theme_minimal(base_size = 12) + theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+
+p1 | p2
+```
+
+The joint and per-antigen models give nearly identical accuracy (M3 improves 9.0%
+single-task versus 8.7% multitask; M4 8.2% versus 8.8%), so the result does not
+depend on the joint formulation.
+
+# Micro-cluster sensitivity: 2,000 versus 5,000
+
+The primary pipeline uses 5,000 micro-clusters. Repeating it with 2,000 checks
+that the finer micro-clustering is not itself driving the result.
+
+```{r microcluster-sensitivity, fig.width=12, fig.height=9}
+if (all(file.exists(c(MSE_2000, CI_2000, AGG_2000)))) {
+  mse_5000 <- fread(MSE_5000); mse_2000 <- fread(MSE_2000)
+  ci_5000  <- fread(CI_5000);  ci_2000  <- fread(CI_2000)
+} else {
+  # ---- The 2,000-micro-cluster run rebuilds the whole per-fold atlas at a
+  #      different resolution; it needs the raw CyTOF object and the atlas
+  #      helpers (available from the corresponding author). ----
+  stop("2,000-micro-cluster results not found; see Data Availability.")
+}
+
+# Panel A: M1->M3 improvement with bootstrap CI, 2,000 vs 5,000.
+keep <- c("overall", VIRUSES)
+comp <- rbind(cbind(ci_5000[comparison == "M1_vs_M3" & virus %in% keep], n_micro = "5,000"),
+              cbind(ci_2000[comparison == "M1_vs_M3" & virus %in% keep], n_micro = "2,000"))
+comp[, virus_label := factor(virus, levels = c("h1n1", "h3n2", "bvic", "overall"),
+                             labels = c("H1N1", "H3N2", "B/Vic", "Overall"))]
+p_a <- ggplot(comp, aes(virus_label, delta_pct, fill = n_micro)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), position = position_dodge(width = 0.7), width = 0.2) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  scale_fill_manual(values = c("2,000" = "#92c5de", "5,000" = "#2166ac"), name = "Micro-clusters") +
+  labs(x = NULL, y = "MSE improvement (%) over M1", title = "A. Micro-cluster sensitivity (M1 -> M3)") +
+  theme_minimal(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12), legend.position = "bottom")
+
+# Panel B: k selected per fold, both runs.
+k5 <- {load(AGG_5000); selected_k_per_fold}
+k2 <- {load(AGG_2000); selected_k_per_fold}
+k_df <- data.table(fold = rep(paste0("Fold ", 1:5), 2), k = c(k2, k5),
+                   n_micro = rep(c("2,000", "5,000"), each = 5))
+p_b <- ggplot(k_df, aes(fold, k, fill = n_micro)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_text(aes(label = k), position = position_dodge(width = 0.7), vjust = -0.3, size = 3.2) +
+  scale_fill_manual(values = c("2,000" = "#92c5de", "5,000" = "#2166ac"), name = "Micro-clusters") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = "Meta-clusters (k)", title = "B. k-selection stability") +
+  theme_minimal(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12), legend.position = "bottom")
+
+# Panel C: full four-model ladder MSE, both runs. (Reload the 5,000 aggregate,
+# since the block above left the 2,000 objects in scope.)
+load(AGG_5000)
+models <- c("M1_en", "M2_en", "M3_en", "M4_en")
+ladder <- rbind(cbind(mse_5000[virus == "overall" & model %in% models], n_micro = "5,000"),
+                cbind(mse_2000[virus == "overall" & model %in% models], n_micro = "2,000"))
+ladder[, model_label := factor(model, levels = models,
+  labels = c("M1\n(titers)", "M2\n(+clinical)", "M3\n(+clusters)", "M4\n(full)"))]
+p_c <- ggplot(ladder, aes(model_label, mse, fill = n_micro)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_text(aes(label = sprintf("%.3f", mse)), position = position_dodge(width = 0.7), vjust = -0.3, size = 3) +
+  scale_fill_manual(values = c("2,000" = "#92c5de", "5,000" = "#2166ac"), name = "Micro-clusters") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = NULL, y = "Overall test MSE", title = "C. Model ladder MSE") +
+  theme_minimal(base_size = 12) + theme(plot.title = element_text(face = "bold", size = 12), legend.position = "bottom")
+
+(p_a | p_b) / p_c
+```
+
+The overall M1-to-M3 improvement is similar (8.3% vs 8.7%), but 5,000
+micro-clusters give more consistent k across folds (22--36 for 4/5 folds versus a
+highly variable 7--30 for the 2,000 run), which is why the finer resolution was
+used for the primary analysis.
+
+# One-episode-per-recipient sensitivity
+
+Eighty recipients contributed two episodes. Restricting to only the first
+episode per recipient (n = 263, no within-recipient correlation at all) checks
+that the headline result is not an artifact of the repeated measurements.
+
+```{r single-obs}
+if (file.exists(SINGLE_OBS_BOOT)) {
+  so <- fread(SINGLE_OBS_BOOT)
+} else {
+  stop("One-episode-per-recipient sensitivity cache not found; see Data Availability.")
+}
+kable(so[virus == "overall", .(Comparison = contrast, n = n_recipients,
+        `MSE from` = round(mse_from, 3), `MSE to` = round(mse_to, 3),
+        `Improvement (%)` = round(pct_improve, 1),
+        `95% CI` = sprintf("[%.1f, %.1f]", ci_pct_low, ci_pct_high),
+        `p` = sprintf("%.3f", p_two_sided))],
+      caption = "One episode per recipient (n = 263): recipient-clustered bootstrap.")
+```
+
+On the single-episode subset the M1-to-M3 improvement is 9.1% (p = 0.008) and
+M2-to-M4 is 7.2% (p = 0.023), comparable to the full-cohort estimates. The
+finding is not driven by the repeated within-recipient measurements.
+
+# Interaction-rich clinical baseline
+
+A linear clinical model (M2) might understate the clinical covariates and
+inflate the apparent cluster gain. To rule this out we build an interaction-rich
+clinical baseline with all pairwise interactions of the seven M2 features, and
+compare the cluster models against it.
+
+```{r interaction}
+if (file.exists(INT_M2)) {
+  im2 <- fread(INT_M2)   # M3 vs the interaction-rich clinical baseline, per antigen
+  im4 <- fread(INT_M4)   # interaction-rich M4 vs M2, overall + per antigen
+} else {
+  stop("Interaction-baseline caches not found; see Data Availability.")
+}
+kable(im2[, .(Antigen = toupper(virus), `M2-int MSE` = round(mse_M2_prime, 3),
+             `M3 MSE` = round(mse_M3, 3), `M3 vs M2-int (%)` = round(improvement_pct, 1))],
+      caption = "Cluster-only model (M3) vs an interaction-rich clinical baseline (M2-int).")
+```
+
+Even against a clinical model given all pairwise interactions, the cluster main
+effects still add substantial predictive value (M3 improves on the
+interaction-rich baseline by 7.4% overall, with consistent per-antigen gains),
+so the cellular signal is not an artifact of the linear clinical specification.
+
+# Counterfactual dose subgroups (T-learner)
+
+The randomized dose assignment in the parent trials supports a
+risk-stratification question: which recipients are predicted to respond poorly
+regardless of vaccine formulation? A T-learner fits separate random forests for
+standard-dose and high-dose recipients, then predicts every recipient's response
+under both scenarios. Recipients in the bottom quartile of both predictions are
+candidate non-responders.
+
+```{r dose-tlearner, fig.width=12, fig.height=5.5}
+if (file.exists(DOSE_FILE)) {
+  # Load the precomputed dose analysis; we reuse its per-antigen feature matrix
+  # and outcomes to fit the T-learner (the T-learner itself is fast).
+  dose <- new.env(parent = emptyenv()); load(DOSE_FILE, envir = dose)
+} else {
+  stop("Dose analysis object not found; see Data Availability.")
+}
+suppressPackageStartupMessages(library(randomForest))
+
+tl_list <- lapply(VIRUSES, function(v) {
+  r <- dose$results[[v]]
+  X <- r$X_cov; y <- r$patient_dt$y_true; W <- r$patient_dt$dose_actual
+  dose_cols <- grep("dose", colnames(X), ignore.case = TRUE)
+  if (length(dose_cols)) X <- X[, -dose_cols, drop = FALSE]
+  set.seed(20270222)
+  rf_hd <- randomForest(X[W == 1, , drop = FALSE], y[W == 1], ntree = 500)
+  rf_sd <- randomForest(X[W == 0, , drop = FALSE], y[W == 0], ntree = 500)
+  data.table(virus = v, y_hat_hd = as.numeric(predict(rf_hd, X)),
+             y_hat_sd = as.numeric(predict(rf_sd, X)))
+})
+tl_dt <- rbindlist(tl_list)
+
+# Subgroups: bottom / top quartile of BOTH counterfactual predictions.
+tl_dt[, `:=`(q25_sd = quantile(y_hat_sd, .25), q25_hd = quantile(y_hat_hd, .25),
+             q75_sd = quantile(y_hat_sd, .75), q75_hd = quantile(y_hat_hd, .75)), by = virus]
+tl_dt[, subgroup := fifelse(y_hat_sd < q25_sd & y_hat_hd < q25_hd, "Non-responder",
+                    fifelse(y_hat_sd > q75_sd & y_hat_hd > q75_hd, "Good responder", "Intermediate"))]
+tl_dt[, virus_label := factor(virus, levels = VIRUSES, labels = c("H1N1", "H3N2", "B/Victoria"))]
+
+ggplot(tl_dt, aes(y_hat_sd, y_hat_hd, color = subgroup)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", alpha = 0.3) +
+  geom_point(alpha = 0.7, size = 2) +
+  scale_color_manual(values = c("Non-responder" = "#d62728", "Intermediate" = "gray60",
+                                "Good responder" = "#2ca02c"), name = "Subgroup") +
+  facet_wrap(~ virus_label, scales = "free") +
+  labs(title = "Counterfactual subgroup discovery (T-learner)",
+       subtitle = "Predicted response under SD vs HD; non-responders = bottom quartile of both",
+       x = "Predicted response under standard dose", y = "Predicted response under high dose") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+
+cat("Predicted non-responders per antigen (bottom quartile under both doses):\n")
+print(tl_dt[, .(n = sum(subgroup == "Non-responder"),
+                pct = round(100 * mean(subgroup == "Non-responder"), 1)), by = virus_label])
+```
+
+A small subgroup (11--13% of recipients across antigens) falls in the bottom
+quartile of predicted response under both dose scenarios. These predicted
+non-responders tend to have lower baseline titers and earlier time
+post-transplant, consistent with incomplete immune reconstitution, and are a
+candidate group for alternative vaccination strategies.

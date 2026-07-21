@@ -1,0 +1,289 @@
+---
+title: "Atlas construction and meta-cluster (k) selection"
+subtitle: "Deep immune cell phenotyping predicts influenza vaccine immunogenicity in HCT recipients"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 2
+    number_sections: true
+    code_folding: show
+    self_contained: true
+    fig_width: 10
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 7)
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(patchwork)
+})
+```
+
+# What this notebook does
+
+This notebook documents the first stage of the analysis: turning each patient's
+raw single-cell mass cytometry (CyTOF) profile into a fixed-length
+"cellular-composition" vector, and choosing how finely to group cells into
+immune-cell populations.
+
+Each pre-vaccination blood sample was profiled with a 30-marker CyTOF panel,
+yielding tens of thousands of cells per sample and roughly 14.8 million cells in
+total. Different patients contribute different numbers of cells, so we cannot
+feed the raw cells directly into a prediction model. Instead we build an
+**atlas**: a shared map of marker space that lets us describe every patient by
+the *fraction* of their cells that fall into each immune-cell population. The
+pipeline has two grouping steps:
+
+1. **Micro-clustering.** One million cells are grouped by k-means into 5,000
+   very fine "micro-clusters." Each micro-cluster is a tiny bin of cells with
+   almost identical marker expression. Five thousand is deliberately far more
+   than the number of real cell types, so each population is split across many
+   bins. The 5,000 cluster centers define the atlas.
+2. **Meta-clustering.** The 5,000 centers are connected into a nearest-neighbor
+   graph and partitioned by Leiden community detection into a smaller number of
+   coherent populations (**meta-clusters**). Each meta-cluster is one broad cell
+   type or subset. The Leiden *resolution* controls how many meta-clusters form;
+   we write the resulting count as **k**.
+
+Every cell (from every patient) is then assigned to its nearest micro-cluster
+and, through that, to a meta-cluster. A patient is summarized by how their cells
+are distributed across the k meta-clusters. These proportions become the
+cellular-composition features used everywhere downstream.
+
+To keep feature construction honest, the whole atlas is rebuilt **separately
+inside each cross-validation fold**, using only that fold's training patients,
+so no information from the held-out patients ever leaks into how the features
+are defined. The resolution (and therefore k) is chosen by an inner
+cross-validation loop within each fold. This notebook shows (i) the single
+"production" atlas built on all patients, which is used only for biological
+interpretation and visualization, and (ii) **Figure 1**, which reports how k was
+selected across the five outer folds.
+
+```{r paths}
+# ---------------------------------------------------------------------------
+# Edit these two paths to point at your local copy of the intermediate data.
+# The intermediate objects are NOT distributed with this repository; they are
+# available from the corresponding author on reasonable request (see README,
+# Data Availability). With them in place, this notebook knits by LOADING the
+# cached objects rather than recomputing the atlas.
+# ---------------------------------------------------------------------------
+FAST <- "/fast/datasets/flu_cellular_prediction"                 # fast data drive
+REPO <- "/home/amir/repo/flu-cellular-prediction"                # project repo
+
+PROD_ATLAS <- file.path(REPO, "results", "final_atlas_production",
+                        "final_atlas_e862228d.RData")
+PER_FOLD   <- file.path(FAST, "per_fold_atlas_5000")             # 5 outer-fold atlases
+```
+
+# The production atlas
+
+The production atlas is one atlas built on all 343 vaccination episodes. It is
+used only for biological interpretation (Figures 3--4 and the supplement); it is
+never used to estimate predictive performance, because a single all-patient
+atlas would leak held-out information. The leakage-free per-fold atlases (next
+section) are what the performance numbers rest on.
+
+```{r load-production-atlas}
+if (file.exists(PROD_ATLAS)) {
+  # Load the precomputed production atlas (fast: no clustering is re-run).
+  atlas <- new.env(parent = emptyenv())
+  load(PROD_ATLAS, envir = atlas)
+} else {
+  # ---- Heavy compute (requires the raw CyTOF object; not run when the cache
+  #      above is present). This block reproduces how the production atlas was
+  #      built. It needs the de-identified cell-level object and the atlas
+  #      helper functions, both available from the corresponding author. ----
+  source(file.path(REPO, "methods", "00-paths.R"))
+  source(file.path(REPO, "methods", "35-per-fold-atlas-cv.R"))
+  load(file.path(paths$raw, "hsct_transplant_object_harmony_final_small.RData"))
+  full_data <- obj$batch_correction$data      # cells x 30 markers
+  full_p_id <- obj$source                      # patient id per cell
+
+  # 5,000 micro-clusters from 1,000,000 subsampled cells, then Leiden
+  # meta-clustering at the resolution that gives the target k = 33.
+  atlas_built <- build_atlas_for_fold(
+    full_data = full_data, full_p_id = full_p_id,
+    train_patient_ids = unique(full_p_id),
+    n_micro = 5000L, n_neighbors = 30L,
+    kmeans_fit_n_cells = 1000000L, seed = 20260222, verbose = TRUE)
+  stop("Production atlas rebuilt from raw data; re-save as ", PROD_ATLAS,
+       " to cache it for future knits.")
+}
+
+# --- Summarize what the atlas contains ---
+k_prod <- atlas$selected_k
+cat("Micro-clusters (k-means centers):", nrow(atlas$centroids), "\n")
+cat("Markers:", ncol(atlas$centroids), "\n")
+cat("Meta-clusters (k) at production resolution:", k_prod, "\n")
+cat("Leiden resolution:", round(atlas$selected_res, 3), "\n")
+cat("Vaccination episodes summarized:", nrow(atlas$clr_features), "\n")
+cat("Composition feature matrix (episodes x meta-clusters): ",
+    paste(dim(atlas$clr_features), collapse = " x "), "\n")
+```
+
+The production atlas resolves `r k_prod` meta-clusters. Each of the 343
+vaccination episodes is described by `r k_prod` centered-log-ratio (CLR)
+composition features, one per meta-cluster. The CLR transform (defined in
+notebook 02) expresses each population's abundance relative to the patient's
+geometric-mean abundance, which is the appropriate representation for
+proportions that are constrained to sum to one.
+
+# Figure 1: resolution / k selection across folds
+
+Performance is estimated by 5-fold cross-validation grouped by recipient, so all
+episodes from one recipient (including both study years) stay together in a
+single fold. Within each outer fold the atlas is rebuilt from scratch on the
+training patients, and the Leiden resolution is chosen by an **inner** 3-fold
+cross-validation: for each candidate resolution the full pipeline is rebuilt and
+scored by the median (across the three influenza antigens) of the ratio
+"cluster-model MSE / titers-only baseline MSE." A ratio below 1 means the
+cellular-composition features improve on the titers-only baseline. The resolution
+with the lowest inner-CV score is selected, which fixes k for that fold.
+
+Figure 1 has three panels:
+
+- **A** -- the inner-CV score for every candidate resolution in every outer fold
+  (blue = below 1 = clusters help), with a star at the selected resolution.
+- **B** -- the number of meta-clusters k selected in each outer fold.
+- **C** -- the resulting held-out MSE improvement of M3 (titers + clusters) over
+  M1 (titers only), per antigen and overall, in each fold.
+
+```{r load-fold-artifacts}
+n_folds <- 5L
+fold_files <- file.path(PER_FOLD, sprintf("fold_%d", 1:n_folds),
+                        sprintf("fold_%d_all.RData", 1:n_folds))
+
+if (all(file.exists(fold_files))) {
+  # Load the five precomputed per-fold atlases. Each artifact stores that fold's
+  # atlas, the inner-CV resolution scores, the selected k, the held-out
+  # predictions for models M1-M4, and the held-out outcomes.
+  fold_data <- lapply(fold_files, function(f) {
+    e <- new.env(parent = emptyenv()); load(f, envir = e); e
+  })
+} else {
+  # ---- Heavy compute (per-fold atlas + nested CV; requires the raw CyTOF
+  #      object and the pipeline helpers, available from the corresponding
+  #      author; not run when the cached fold artifacts are present). This is
+  #      the authoritative per-fold pipeline that the whole study rests on. ----
+  source(file.path(REPO, "methods", "00-paths.R"))
+  source(file.path(REPO, "methods", "08-multi-outcome-covariates.R"))
+  source(file.path(REPO, "methods", "35-per-fold-atlas-cv.R"))
+  load(file.path(paths$raw, "hsct_transplant_object_harmony_final_small.RData"))
+  full_data <- obj$batch_correction$data
+  full_p_id <- obj$source
+  # For each of the 5 recipient-grouped outer folds:
+  #   1. build_atlas_for_fold() on the training patients only (5,000 micro-
+  #      clusters from 1,000,000 cells, 30-nearest-neighbor centroid graph);
+  #   2. assign train and test cells to micro- then meta-clusters;
+  #   3. inner 3-fold CV over the Leiden resolution grid to pick k;
+  #   4. CLR-transform meta-cluster proportions into features;
+  #   5. fit the M1-M4 multitask elastic nets and store held-out predictions.
+  # The per-fold driver writes one fold_<i>_all.RData per fold under PER_FOLD;
+  # re-running the per-fold pipeline regenerates them.
+  stop("Per-fold atlases not found at ", PER_FOLD,
+       ". Rebuild with the per-fold pipeline (needs raw data + helpers).")
+}
+```
+
+```{r fig1-panelA, fig.width=11, fig.height=4}
+# --- Panel A: inner-CV score for each resolution and fold ---
+# resolution_scores is a named vector (names = Leiden resolutions); a score < 1
+# means cluster features beat the titers-only baseline at that resolution.
+heatmap_df <- do.call(rbind, lapply(1:n_folds, function(f) {
+  scores <- fold_data[[f]]$resolution_scores
+  data.frame(
+    fold        = paste0("Fold ", f),
+    resolution  = as.numeric(names(scores)),
+    score       = as.numeric(scores),
+    is_selected = abs(as.numeric(names(scores)) -
+                        fold_data[[f]]$selected_resolution) < 0.01,
+    stringsAsFactors = FALSE)
+}))
+
+p_a <- ggplot(heatmap_df, aes(factor(resolution), fold, fill = score)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_point(data = subset(heatmap_df, is_selected),
+             shape = 8, size = 3, color = "red", show.legend = FALSE) +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                       midpoint = 1.0, name = "Median\nMSE ratio",
+                       limits = c(min(heatmap_df$score, 0.85),
+                                  max(heatmap_df$score, 1.15))) +
+  labs(x = "Leiden resolution", y = NULL,
+       title = "A. Inner CV: median MSE ratio (cluster / baseline)") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        plot.title = element_text(face = "bold", size = 12),
+        panel.grid = element_blank())
+p_a
+```
+
+```{r fig1-panelBC, fig.width=11, fig.height=5}
+# --- Panel B: number of meta-clusters (k) selected per outer fold ---
+k_df <- data.frame(
+  fold = paste0("Fold ", 1:n_folds),
+  k    = vapply(1:n_folds, function(f) as.integer(fold_data[[f]]$k_found), integer(1)))
+
+p_b <- ggplot(k_df, aes(fold, k)) +
+  geom_col(fill = "#4393c3", width = 0.6) +
+  geom_text(aes(label = k), vjust = -0.3, size = 4, fontface = "bold") +
+  geom_hline(yintercept = median(k_df$k), linetype = "dashed", color = "red") +
+  annotate("text", x = 5.4, y = median(k_df$k) + 1.5,
+           label = paste0("median = ", median(k_df$k)),
+           color = "red", hjust = 1, size = 3.5) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = "Meta-clusters (k)", title = "B. Selected k per outer fold") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 12),
+        panel.grid.minor = element_blank())
+
+# --- Panel C: held-out MSE improvement of M3 over M1, per antigen and overall ---
+perf_df <- do.call(rbind, lapply(1:n_folds, function(f) {
+  e <- fold_data[[f]]
+  Y  <- e$Y_test; p1 <- e$pred_M1_en_test; p3 <- e$pred_M3_en_test
+  per_v <- do.call(rbind, lapply(colnames(Y), function(v) {
+    data.frame(fold = paste0("Fold ", f), virus = toupper(v),
+               improvement = 100 * (1 - mean((Y[, v] - p3[, v])^2) /
+                                        mean((Y[, v] - p1[, v])^2)))
+  }))
+  overall <- data.frame(fold = paste0("Fold ", f), virus = "Overall",
+                        improvement = 100 * (1 - mean((Y - p3)^2) / mean((Y - p1)^2)))
+  rbind(per_v, overall)
+}))
+perf_df$virus <- gsub("BVIC", "B/Vic", perf_df$virus)
+perf_df$virus <- factor(perf_df$virus, levels = c("H1N1", "H3N2", "B/Vic", "Overall"))
+
+p_c <- ggplot(perf_df, aes(fold, improvement, fill = virus)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+  geom_hline(yintercept = 0, linewidth = 0.4) +
+  scale_fill_manual(values = c("H1N1" = "#66c2a5", "H3N2" = "#fc8d62",
+                               "B/Vic" = "#8da0cb", "Overall" = "#e78ac3"),
+                    name = "Antigen") +
+  labs(x = NULL, y = "MSE improvement (%)\n(M3 vs M1)",
+       title = "C. Per-fold MSE improvement (clusters vs titers-only)") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 12),
+        panel.grid.minor = element_blank(), legend.position = "bottom")
+
+(p_b | p_c)
+```
+
+```{r fig1-summary}
+# Selected k per fold and the median, as reported in the manuscript.
+data.frame(Fold = 1:n_folds,
+           Resolution = vapply(1:n_folds,
+                               function(f) fold_data[[f]]$selected_resolution, numeric(1)),
+           k = k_df$k)
+cat("\nMedian k across folds:", median(k_df$k), "\n")
+```
+
+Four of the five folds select k in the 22--36 range (median 30); one fold
+selects a much smaller k, consistent with the flat inner-CV surface visible in
+Panel A, where scores stay below 1 across a wide band of resolutions. The
+cellular-composition features improve on the titers-only baseline in every fold
+(Panel C), which is the qualitative signal quantified formally in notebook 02.

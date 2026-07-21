@@ -1,0 +1,41 @@
+# =============================================================================
+# Data must NOT be committed to this public repository.
+# Patient-derived CyTOF data and all precomputed intermediate objects are
+# available from the corresponding author on reasonable request (see README,
+# Data Availability). Only source notebooks (.Rmd), their knitted HTML,
+# and the project metadata files belong in version control.
+# =============================================================================
+
+# Serialized R data and analysis outputs
+*.RData
+*.rds
+*.Rds
+*.rda
+
+# Tabular data and flow-cytometry files
+*.csv
+*.tsv
+*.fcs
+
+# Fast data drive and any local data directories
+/fast
+/fast/**
+data/
+results/
+intermediate/
+per_fold_atlas_*/
+post_hoc_*/
+final_atlas_production/
+
+# knitr / rmarkdown byproducts (the committed HTML is built deliberately)
+*_files/
+*_cache/
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*~
