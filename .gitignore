@@ -2,8 +2,8 @@
 # Data must NOT be committed to this public repository.
 # Patient-derived CyTOF data and all precomputed intermediate objects are
 # available from the corresponding author on reasonable request (see README,
-# Data Availability). Only source notebooks (.Rmd), their knitted HTML,
-# and the project metadata files belong in version control.
+# Data Availability). Only analysis code, the earlier notebooks and their
+# knitted HTML belong in version control.
 # =============================================================================
 
 # Serialized R data and analysis outputs
@@ -16,6 +16,8 @@
 *.csv
 *.tsv
 *.fcs
+*.h5
+*.log
 
 # Fast data drive and any local data directories
 /fast

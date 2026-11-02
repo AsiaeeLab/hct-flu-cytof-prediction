@@ -1,112 +1,68 @@
 # Deep immune cell phenotyping predicts influenza vaccine immunogenicity in HCT recipients
 
-Analysis code accompanying the manuscript
-*Deep Immune Cell Phenotyping Predicts Influenza Vaccine Immunogenicity in HCT
-Recipients.*
+Analysis code for the manuscript of the same title (Asiaee, Pal, Simmons,
+Spieker, Chappell, Halasa, Kalams and the Influenza Vaccine in HCT Study Group;
+preprint on medRxiv, 2026).
 
-This repository holds the R Markdown notebooks that regenerate every figure and
-table in the manuscript and its supplement, together with the knitted HTML
-reports. The patient-derived cytometry data and the precomputed intermediate
-objects are not distributed here; see [Data availability](#data-availability).
+The study asks whether pre-vaccination immune-cell composition, measured by
+30-marker mass cytometry, predicts the influenza antibody response of allogeneic
+hematopoietic cell transplant (HCT) recipients beyond their baseline titers and
+clinical factors. It uses the first vaccination season of 260 recipients (147
+children, 113 adults) from two multicenter phase 2 trials of high- versus
+standard-dose vaccine (NCT02860039, NCT03179761), and holds out 74 second-season
+episodes for validation. The outcome is the composite log fold-rise in HAI titer
+from before vaccination to 4 weeks after the second dose, averaged over H1N1,
+H3N2 and B/Victoria.
 
-## Overview
+## Pipeline
 
-We analyzed 343 influenza-vaccination episodes from 263 allogeneic
-hematopoietic-cell-transplant (HCT) recipients enrolled in two multi-center,
-NIH-funded Phase II randomized trials of high- versus standard-dose inactivated
-influenza vaccine (one pediatric, one adult). Pre-vaccination blood was profiled
-by 30-marker mass cytometry (CyTOF). The analysis converts each single-cell
-profile into a centered-log-ratio cellular-composition vector using a
-recipient-grouped, per-fold atlas pipeline (feature construction is kept strictly
-separate from prediction), and quantifies the contribution of cellular
-composition beyond the pre-vaccination HAI titer and clinical covariates with a
-four-model elastic-net ladder and recipient-clustered bootstrap inference.
+1. **Titers.** HAI titers are taken from the trial REDCap exports
+   (`experiments/E17-07-redcap-titers.R`): geometric mean of duplicate wells,
+   below-detection results set to 5.
+2. **Per-fold atlases.** Recipients are split into five outer folds. In each
+   outer training set, about a million cells are clustered into 5,000 k-means
+   micro-clusters, and Leiden clustering of the micro-cluster graph gives
+   candidate partitions over a grid of resolutions
+   (`experiments/E14-01-first-episode-perfold.R`, `methods/35-per-fold-atlas-cv.R`).
+   No outcome is used in this step.
+3. **Model fitting.** Inside each training set, three inner folds choose the
+   resolution, and elastic nets are fitted for four nested models: titers (M1),
+   titers and clinical factors (M2), titers and composition (M3), and all three
+   (M4). Held-out recipients' cells are assigned to the frozen atlas and their
+   responses predicted (`experiments/E17-05-refit-missing-titers.R`).
+4. **Inference and interpretation.** Recipient-level bootstrap intervals, a
+   training-aware null bootstrap for the score tests, a shared 35-population
+   atlas used only to name and compare populations, selection stability,
+   per-cohort and transfer analyses, the second-season validation, marker
+   reduction and the all-episode sensitivity analysis.
 
-The notebooks are organized by theme. Each one is commented for a general
-scientific reader: it explains, in plain language, what each step does and what
-the output means, so that a hematologist or immunologist can follow the logic
-without a machine-learning background.
+`run/run_pipeline.sh` runs every step in order; `run/env.sh` sets the data and
+results folders. Figures are written to `paper/images/` and tables to
+`paper/tables/`.
 
-## Notebook-to-figure map
+## Layout
 
-Every notebook is designed to knit by **loading** the precomputed intermediate
-objects rather than re-running the expensive clustering, cross-validation, or
-bootstrap. Compute-intensive steps are guarded so that, when the cached objects
-are present, the notebook simply loads them.
+- `methods/` shared functions: data preparation, two-stage clustering, per-fold
+  atlas and cross-validation helpers, outcome and covariate handling.
+- `experiments/` one script per analysis step, figure or table, named by the
+  analysis round in which it was introduced.
+- `run/` environment settings and the full run order.
+- `notebooks_2026-07/` earlier R Markdown notebooks for the July 2026 analysis of
+  343 episodes. They do not reproduce the current results and are kept for
+  reference.
 
-| Notebook | Manuscript outputs regenerated |
-|----------|--------------------------------|
-| `01-atlas-construction-and-k-selection.Rmd` | **Figure 1** (atlas pipeline and resolution/k-selection across folds); production-atlas summary |
-| `02-four-model-ladder-and-inference.Rmd` | **Figure 2** (four-model ladder with bootstrap CIs); **Table 1** (ladder MSE); **Table 2** (recipient-clustered bootstrap); **Table 3** (baseline-titer stratification); **Supplementary Table** (HAI noise floor) |
-| `03-cluster-biology-and-annotation.Rmd` | **Figure 3** (annotated UMAP); **Supplementary Figures** (faceted UMAP; biclustered marker heatmap); **Supplementary Table** (meta-cluster annotations); cluster-vs-time-post-transplant regression |
-| `04-feature-importance-and-stability.Rmd` | **Figure 4** (signed feature importance, M4); **Supplementary Figures** (bootstrap stability landscape; selection frequency; coefficient distributions) |
-| `05-per-cohort-and-transfer.Rmd` | **Figure 5** (per-cohort gain, feature selection, and stratification); **Supplementary Figure** (cross-cohort transfer) |
-| `06-repeater-longitudinal.Rmd` | **Figure 6** (repeater antigen-count transitions); **Supplementary Figures** (reconstitution schematic; PCA trajectories; per-cluster change; cross-sectional predicted-response scatter) |
-| `07-marker-panel-reduction.Rmd` | **Figure 7** (15-marker panel reduction) |
-| `08-sensitivity-and-dose-supplement.Rmd` | **Supplementary Figures** (multitask vs single-task; 2,000-vs-5,000 micro-cluster sensitivity; counterfactual dose subgroups); one-episode-per-recipient and interaction-rich-baseline sensitivity analyses |
+## Requirements
 
-Together the eight notebooks regenerate all 7 main figures, all 13 supplementary
-figures, the 3 main tables, and both supplementary tables (the meta-cluster
-annotation table and the noise-floor table).
-
-## Repository contents
-
-- `*.Rmd` -- the eight analysis notebooks (source).
-- `*.html` -- the knitted reports. These are the rendered outputs; because the
-  data is not distributed, the HTML files are the way to see the figures and
-  tables without access to the intermediate objects.
-- `README.md`, `LICENSE`, `.gitignore`.
-
-No data files are included. The `.gitignore` explicitly excludes `*.RData`,
-`*.rds`, `*.csv`, `*.fcs`, the `/fast` data drive, and any local results
-directories, so that no patient-derived or intermediate data can be committed by
-accident.
-
-## Environment and dependencies
-
-The analyses were performed in R 4.5.2; the HTML reports in this repository were
-last knitted under R 4.6.1. Rendering the notebooks with the cached intermediate
-objects present requires:
-
-- `rmarkdown`, `knitr` -- notebook rendering
-- `ggplot2`, `patchwork`, `scales` -- figures
-- `data.table` -- data manipulation
-- `randomForest` -- the counterfactual dose T-learner (notebook 08)
-
-Reproducing the intermediate objects from raw data (the guarded "heavy compute"
-branches) additionally requires `glmnet` (elastic net), `igraph` (Leiden
-community detection), and `RANN` (nearest-neighbor cell assignment), along with
-the atlas helper functions from the project code and the raw CyTOF object.
-
-Approximate versions used for the knitted reports: R 4.6.1, ggplot2 4.0.3,
-patchwork 1.3.2, data.table 1.18.4, scales 1.4.0, randomForest 4.7.1.2,
-knitr 1.51, rmarkdown 2.31 (glmnet 5.0 and igraph 2.3.2 for full recomputation).
-
-## How to run
-
-1. Obtain the intermediate objects (see Data availability) and place them on a
-   local drive.
-2. At the top of each notebook, edit the two path variables (`FAST` and `REPO`)
-   to point at your copy of the intermediate data. The notebooks reference these
-   paths but do not copy any data into this repository.
-3. Knit a notebook with, for example:
-
-   ```r
-   rmarkdown::render("02-four-model-ladder-and-inference.Rmd")
-   ```
-
-   With the cached objects present, each notebook loads them and produces the
-   figures, tables, and a complete HTML report. It does not re-run the
-   clustering, cross-validation, or bootstrap.
+R (4.4) with data.table, here, glmnet, igraph, RANN, FNN, pROC, ggplot2,
+patchwork, ggrepel, scales, uwot, randomForest, ranger, caret, sandwich,
+lmtest, digest, doParallel and rjson; Python 3 with pandas and numpy for the
+LaTeX table scripts.
 
 ## Data availability
 
-The de-identified CyTOF data and the precomputed intermediate objects that
-support the findings of this study are available from the corresponding author
-upon reasonable request. Consistent with the manuscript's Data Sharing
-Statement, no patient-derived data and no intermediate analysis objects are
-included in this repository; only the source notebooks and their knitted HTML
-reports are provided.
+The de-identified CyTOF data, trial data and intermediate analysis objects are
+available from the corresponding author upon reasonable request. No
+patient-derived data and no analysis outputs are included in this repository.
 
 ## License
 
